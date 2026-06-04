@@ -395,10 +395,10 @@ impl Executor {
     }
 }
 
-/// 上游錯誤是否屬於「換帳號就可解」類型（quota 配額、rate-limit、暫時性 internal_error / 503）。
+/// 上游錯誤是否屬於「換帳號就可解」類型。
 /// 用於 SSE 中途已 yield 過 answer-phase content delta 後仍應跨帳號重試的判定 ——
-/// 這類錯誤跟「auth_error / 內容安全 / 客戶端格式錯」不一樣，跟使用者的 prompt 無關，
-/// 純粹是被分配到的那個上游帳號用滿了配額／被限流，下一個帳號通常會成功。
+/// 這類錯誤跟「auth_error / 客戶端格式錯」不一樣，跟使用者的 prompt 內容**不必然**相關，
+/// 換一個上游帳號（不同 instance / 路由 / 額度）通常能繞過。
 fn is_account_swap_retryable(err: &str) -> bool {
     let lower = err.to_lowercase();
     // quota / 額度：阿里云 model studio 的 "Allocated quota exceeded" 是典型；
@@ -427,6 +427,12 @@ fn is_account_swap_retryable(err: &str) -> bool {
         || lower.contains("502")
         || lower.contains("504")
     {
+        return true;
+    }
+    // 內容安全 false-positive：阿里云對 thinking model 輸出 / fetch 結果偶發過敏，
+    // 不同上游帳號審查結果不一定相同 → 給 1-2 次跨帳號重試機會。
+    // 即便真敏感，受 max_retries=3 上限保護，最差只多等 ~20s 才吐 error。
+    if lower.contains("data_inspection_failed") || lower.contains("内容安全") {
         return true;
     }
     false
@@ -475,11 +481,10 @@ mod tests {
         }
     }
 
-    /// 內容安全 / 認證 / 客戶端問題 → 換帳號沒用，不該重試
+    /// 認證 / 客戶端格式問題 → 換帳號沒用，不該重試
     #[test]
     fn permanent_errors_are_not_swap_retryable() {
         for s in [
-            "code=data_inspection_failed 内容安全警告",
             "401 Unauthorized invalid token",
             "code=auth_error account banned",
             "JSON 解析錯誤",
@@ -487,5 +492,15 @@ mod tests {
         ] {
             assert!(!is_account_swap_retryable(s), "不該 swap-retry: {s}");
         }
+    }
+
+    /// 內容安全 false-positive：給跨帳號重試一次機會（阿里云不同 instance 結果可能不同）。
+    /// 真敏感時受 max_retries 上限保護，不會無限耗 quota。
+    #[test]
+    fn data_inspection_false_positive_is_swap_retryable() {
+        let real_input = "Qwen upstream error code=data_inspection_failed request_id=f9b6df2a-788a-460b-bb15-99a0dcb0f5c1 details=内容安全警告：输入数据可能包含不适当的内容！";
+        let real_output = "Qwen upstream error code=data_inspection_failed details=内容安全警告：输出内容可能包含不适当的内容！";
+        assert!(is_account_swap_retryable(real_input), "input 端內容安全 false-positive 應給跨帳號重試機會");
+        assert!(is_account_swap_retryable(real_output), "output 端 false-positive 同理");
     }
 }

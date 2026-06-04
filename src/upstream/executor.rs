@@ -4,7 +4,7 @@
 use super::chat_id_pool::ChatIdPool;
 use super::client::QwenClient;
 use super::payload::{build_chat_payload, BuildPayloadArgs, ImageOptions};
-use super::sse::{delta_has_meaningful_content, extract_upstream_error, parse_sse_chunk, QwenDelta};
+use super::sse::{delta_has_answer_content, extract_upstream_error, parse_sse_chunk, QwenDelta};
 use crate::account::AccountPool;
 use crate::config::Settings;
 use async_stream::stream;
@@ -248,15 +248,17 @@ impl Executor {
                 // 4) 消費 SSE bytes
                 let mut byte_stream = resp.bytes_stream();
                 let mut buffer: Vec<u8> = Vec::with_capacity(8192);
-                let mut first_delta = false;
                 let mut stream_error: Option<String> = None;
-                let mut retryable = false;
 
-                // 追蹤是否至少有一筆 delta 含 content/reasoning。
-                // 上游偶爾回完整 SSE 但 0 字內容（thinking 異常、上游瞬時降級），
-                // client 看到的就是任務憑空停下；對 t2t 路徑視為「retryable empty response」
-                // 並走跨帳號重試。media（t2i/t2v）content 本來就可能為空（影片 URL 走 phase 變化），跳過此判定。
-                let mut had_meaningful_delta = false;
+                // 追蹤是否至少有一筆「真正回覆」delta（answer-phase content）。
+                // 對 thinking 模型，上游可能跑完 thinking 就斷線（quota 中斷、上游降級），
+                // 此時 client（Claude/OpenAI/Gemini）只看到「Thought for Xs」然後莫名 stop，
+                // 沒有任何 text。要把這個情境視為瞬時錯誤跨帳號重試。
+                // had_answer_content：客戶端真的收到了任何 answer-phase content。
+                // 在「還沒收到 answer content」前就出錯/結束 → 重新取另一個帳號重試。
+                // media（t2i/t2v）content 本來就可能在 phase 變化中為空，仍走 had_answer_content
+                // 判定但 mod.rs 對影片 URL 是經 phase 出來的特殊 content（非空），不會誤判。
+                let mut had_answer_content = false;
 
                 'consume: loop {
                     match byte_stream.next().await {
@@ -269,19 +271,12 @@ impl Executor {
                                 let msg_bytes: Vec<u8> = buffer.drain(..p + 2).collect();
                                 let msg = String::from_utf8_lossy(&msg_bytes[..p]);
                                 if let Some(err) = extract_upstream_error(&msg) {
-                                    if first_delta {
-                                        stream_error = Some(err);
-                                        retryable = false;
-                                    } else {
-                                        stream_error = Some(err);
-                                        retryable = true;
-                                    }
+                                    stream_error = Some(err);
                                     break 'consume;
                                 }
                                 for d in parse_sse_chunk(&msg) {
-                                    first_delta = true;
-                                    if delta_has_meaningful_content(&d) {
-                                        had_meaningful_delta = true;
+                                    if delta_has_answer_content(&d) {
+                                        had_answer_content = true;
                                     }
                                     yield UpstreamEvent::Delta(d);
                                 }
@@ -289,7 +284,6 @@ impl Executor {
                         }
                         Some(Err(e)) => {
                             stream_error = Some(format!("串流讀取錯誤: {e}"));
-                            retryable = !first_delta;
                             break 'consume;
                         }
                         None => break 'consume,
@@ -300,12 +294,10 @@ impl Executor {
                     let msg = String::from_utf8_lossy(&buffer);
                     if let Some(err) = extract_upstream_error(&msg) {
                         stream_error = Some(err);
-                        retryable = !first_delta;
                     } else {
                         for d in parse_sse_chunk(&msg) {
-                            first_delta = true;
-                            if delta_has_meaningful_content(&d) {
-                                had_meaningful_delta = true;
+                            if delta_has_answer_content(&d) {
+                                had_answer_content = true;
                             }
                             yield UpstreamEvent::Delta(d);
                         }
@@ -315,17 +307,18 @@ impl Executor {
                 // 5) 結束（清理由 guard 在 drop 時統一處理：釋放帳號 + 刪會話，恰好一次）
                 match stream_error {
                     None => {
-                        // 空回覆判定：t2t 跑完整輪但 0 字內容 → 視為瞬時失敗、走跨帳號重試。
-                        // 已 yield 的 partial delta 在客戶端「最後再來一輪」覆寫即可（client 期望最終
-                        // 看到的是該帳號的 [DONE]；我們改為 Error 後 mod.rs 不會 yield 那輪的 Done，
-                        // 下一輪如成功才會 yield 最終 Done）。
-                        if params.chat_type == "t2t" && !had_meaningful_delta {
-                            let err = "上游回應為空（無 content 也無 reasoning），視為瞬時錯誤重試".to_string();
+                        // 空回覆判定：t2t 跑完整輪但沒收到 answer-phase content → 視為瞬時失敗、跨帳號重試。
+                        // 對 thinking 模型，上游可能只送 reasoning 就 [DONE]（中斷或上游異常），
+                        // client 等於看到「Thought for Xs」然後停下；對 client 是嚴重 UX 問題。
+                        // 已 yield 的 reasoning/partial delta 在客戶端「最後再來一輪」覆寫即可
+                        // （Anthropic translator 是用 content_block index 各自獨立，重來會開新 thinking/text block；
+                        // OpenAI translator 是純增量，重來會接續再吐；雖非完美，比直接斷掉好得多）。
+                        if params.chat_type == "t2t" && !had_answer_content {
+                            let err = "上游回應無 answer content（可能只有 reasoning 或全空），視為瞬時錯誤重試".to_string();
                             last_error = Some(err.clone());
-                            // 不 classify_and_mark：避免把這帳號標 invalid（401/429 pattern 都不 match，
-                            // classify_and_mark 對「空」也是 no-op；exclude 一輪即可）
+                            // 不 classify_and_mark：避免把這帳號標 invalid（401/429 pattern 都不 match）
                             exclude.insert(email.clone());
-                            tracing::warn!("[執行器] 空回覆視為失敗 第{}次 email={email}", attempt + 1);
+                            tracing::warn!("[執行器] 無 answer 內容視為失敗 第{}次 email={email}", attempt + 1);
                             continue;
                         }
                         if is_pool_acquired {
@@ -335,14 +328,18 @@ impl Executor {
                         return; // guard drop → 刪會話 + 釋放帳號
                     }
                     Some(err) => {
-                        if !retryable || first_delta {
+                        // 還沒看到任何 answer-phase content 就出錯 → 跨帳號重試。
+                        // （舊版以「first_delta」為界，會把 thinking_delta 也算進去，導致 thinking
+                        // 階段中斷的 quota/internal_error 不重試直接吐給 client；現在改用實際 answer
+                        // content 為界，更貼近「客戶端是否已看到答覆」的真意。）
+                        if had_answer_content {
                             yield UpstreamEvent::Error(err);
                             return; // guard drop → 清理
                         }
                         last_error = Some(err.clone());
                         self.classify_and_mark(&email, &err).await;
                         exclude.insert(email.clone());
-                        tracing::warn!("[執行器] 串流錯誤可重試 第{}次 email={email} err={err}", attempt + 1);
+                        tracing::warn!("[執行器] 串流錯誤（無 answer 內容前）可重試 第{}次 email={email} err={err}", attempt + 1);
                         continue; // guard drop → 清理本次帳號/會話，下輪重新取得
                     }
                 }

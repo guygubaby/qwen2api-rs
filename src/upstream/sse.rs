@@ -140,6 +140,15 @@ pub fn delta_has_meaningful_content(d: &QwenDelta) -> bool {
         || d.reasoning_cumulative.as_deref().map_or(false, |s| !s.is_empty())
 }
 
+/// delta 是否含「真正的回覆內容」（answer-phase content；不含 reasoning/thinking）。
+/// 用於 executor 判定「客戶端是否已看到實際回答」——
+/// thinking 模型若只跑完思考就斷掉（quota 中斷、上游無 answer），對 Claude/OpenAI/Gemini
+/// 客戶端等於沒收到任何答覆，此時應跨帳號重試，避免被誤判為成功。
+/// phase 預設值同 mod.rs：未設時當作 "answer"，所以非思考階段也計入。
+pub fn delta_has_answer_content(d: &QwenDelta) -> bool {
+    !d.content.is_empty() && d.phase != "think" && d.phase != "thinking_summary"
+}
+
 fn format_upstream_error(obj: &Value) -> Option<String> {
     let request_id = obj
         .get("request_id")
@@ -336,6 +345,44 @@ mod tests {
         // cumulative=Some("") 也應視為空（防止上游送 "" 仍被誤判為有內容）
         let empty_cumul = QwenDelta { reasoning_cumulative: Some("".into()), ..Default::default() };
         assert!(!delta_has_meaningful_content(&empty_cumul));
+    }
+
+    /// delta_has_answer_content：只把 answer 階段的 content 算「真正回覆」，
+    /// 思考階段（think / thinking_summary）即便 content 非空也不算（罕見，但上游有這種事件）。
+    /// 用於 executor 判定「客戶端是否已看到實際答案」，避免 thinking 中斷被誤判成功。
+    #[test]
+    fn answer_content_detection_excludes_thinking_phase() {
+        // 空 delta、純 reasoning：皆非答覆。
+        assert!(!delta_has_answer_content(&QwenDelta::default()));
+        assert!(!delta_has_answer_content(&QwenDelta {
+            reasoning_incremental: "thinking".into(),
+            ..Default::default()
+        }));
+        assert!(!delta_has_answer_content(&QwenDelta {
+            reasoning_cumulative: Some("acc".into()),
+            ..Default::default()
+        }));
+
+        // answer 階段的 content → 算答覆（phase 預設值與 mod.rs 一致為 "answer"）。
+        assert!(delta_has_answer_content(&QwenDelta {
+            phase: "answer".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }));
+        // 即使 phase 沒帶（解析器預設給 "answer"），content 非空仍算答覆。
+        assert!(delta_has_answer_content(&QwenDelta { content: "hi".into(), ..Default::default() }));
+
+        // think / thinking_summary 階段的 content 不算答覆（避免被誤當成「已回應」）。
+        assert!(!delta_has_answer_content(&QwenDelta {
+            phase: "think".into(),
+            content: "thought-as-content".into(),
+            ..Default::default()
+        }));
+        assert!(!delta_has_answer_content(&QwenDelta {
+            phase: "thinking_summary".into(),
+            content: "summary-as-content".into(),
+            ..Default::default()
+        }));
     }
 
     /// 正常 SSE chunk 與 [DONE] 都不會被誤判為錯誤。

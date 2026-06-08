@@ -14,6 +14,25 @@ The Python implementation only forwards normal chat content and thinking/text st
 - `POST /messages`
 - `POST /anthropic/v1/messages`
 
+## Model Modes
+
+`/v1/models` returns both base models and `-thinking` aliases. For example:
+
+- `qwen3.7-plus`
+- `qwen3.7-plus-thinking`
+- `qwen3.7-max`
+- `qwen3.7-max-thinking`
+
+When a request uses a model ending in `-thinking`, the gateway enables Qwen thinking and sends the base model upstream. For example, `qwen3.7-plus-thinking` is sent to Qwen as `qwen3.7-plus`.
+
+Thinking can also be enabled explicitly with:
+
+```json
+{"thinking_enabled": true}
+```
+
+Without the suffix or explicit flag, thinking is disabled by default.
+
 ## Configuration
 
 ```bash

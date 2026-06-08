@@ -21,6 +21,7 @@ logger = logging.getLogger("qwen2api")
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, description=settings.DESCRIPTION)
 pool = AccountPool()
 client = QwenClient()
+THINKING_MODEL_SUFFIX = "-thinking"
 
 
 async def verify_api_key(
@@ -39,7 +40,42 @@ async def verify_api_key(
 
 
 def resolve_model(model: str | None) -> str:
-    return model or settings.DEFAULT_MODEL
+    return str(model or settings.DEFAULT_MODEL)
+
+
+def upstream_model(model: str | None) -> str:
+    resolved = resolve_model(model)
+    if resolved.endswith(THINKING_MODEL_SUFFIX):
+        return resolved[: -len(THINKING_MODEL_SUFFIX)]
+    return resolved
+
+
+def model_enables_thinking(model: str | None) -> bool:
+    return resolve_model(model).endswith(THINKING_MODEL_SUFFIX)
+
+
+def request_enables_thinking(body: dict[str, Any]) -> bool:
+    if model_enables_thinking(body.get("model")):
+        return True
+    if isinstance(body.get("thinking"), dict):
+        return True
+    return bool(body.get("thinking_enabled"))
+
+
+def model_item(model: str) -> dict[str, str]:
+    return {"id": model, "object": "model", "owned_by": "qwen"}
+
+
+def model_items_with_thinking_variants(models: list[str]) -> list[dict[str, str]]:
+    data = []
+    seen = set()
+    for model in models:
+        base = upstream_model(model)
+        for item in (base, f"{base}{THINKING_MODEL_SUFFIX}"):
+            if item not in seen:
+                seen.add(item)
+                data.append(model_item(item))
+    return data
 
 
 def openai_sse(data: dict[str, Any]) -> str:
@@ -51,13 +87,9 @@ def anthropic_sse(event: str, data: dict[str, Any]) -> str:
 
 
 async def qwen_events(body: dict[str, Any]) -> AsyncGenerator[tuple[str, str], None]:
-    model = resolve_model(body.get("model"))
+    model = upstream_model(body.get("model"))
     prompt = build_prompt(body)
-    thinking_enabled = None
-    if isinstance(body.get("thinking"), dict):
-        thinking_enabled = True
-    if "thinking_enabled" in body:
-        thinking_enabled = bool(body.get("thinking_enabled"))
+    thinking_enabled = request_enables_thinking(body)
 
     account = await pool.acquire()
     chat_id = await client.create_chat(account.token, model, "t2t")
@@ -99,15 +131,12 @@ async def models() -> dict[str, Any]:
     try:
         account = await pool.acquire()
         upstream = await client.list_models(account.token)
-        data = [
-            {"id": str(item.get("id") or item.get("name")), "object": "model", "owned_by": "qwen"}
-            for item in upstream
-            if item.get("id") or item.get("name")
-        ]
+        models = [str(item.get("id") or item.get("name")) for item in upstream if item.get("id") or item.get("name")]
+        data = model_items_with_thinking_variants(models)
     except Exception:
         data = []
     if not data:
-        data = [{"id": settings.DEFAULT_MODEL, "object": "model", "owned_by": "qwen"}]
+        data = model_items_with_thinking_variants([settings.DEFAULT_MODEL])
     return {"object": "list", "data": data}
 
 

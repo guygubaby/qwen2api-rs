@@ -127,7 +127,7 @@ mod tests {
     /// 把 translator 產生的 `"data: <json>\n\n"` 字串還原成 Value，方便斷言。
     fn parse_chunk_payload(s: &str) -> Value {
         let body = s.trim_start_matches("data: ").trim();
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("無法解析 chunk JSON: {e}\n原文: {s}"))
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("failed to parse chunk JSON: {e}\nraw: {s}"))
     }
 
     /// role:"assistant" 只在第一個 delta 出現一次（OpenAI 串流契約）。
@@ -144,7 +144,7 @@ mod tests {
 
         let second = t.on_event(&OutEvent::ContentDelta(" there".into()));
         let v2 = parse_chunk_payload(&second[0]);
-        assert!(v2["choices"][0]["delta"].get("role").is_none(), "role 應只送一次");
+        assert!(v2["choices"][0]["delta"].get("role").is_none(), "role should be sent only once");
         assert_eq!(v2["choices"][0]["delta"]["content"], " there");
     }
 
@@ -159,7 +159,7 @@ mod tests {
 
         let next = t.on_event(&OutEvent::ContentDelta("body".into()));
         let vn = parse_chunk_payload(&next[0]);
-        assert!(vn["choices"][0]["delta"].get("role").is_none(), "role 不應重送");
+        assert!(vn["choices"][0]["delta"].get("role").is_none(), "role should not be repeated");
     }
 
     /// Done：產 2 條（最終 chunk 含 usage + finish_reason，加上 `[DONE]` 結尾）。
@@ -168,7 +168,7 @@ mod tests {
         let mut t = OpenAiStreamTranslator::new("gpt-4o");
         let usage = Usage { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8, reasoning_tokens: 1 };
         let out = t.on_event(&OutEvent::Done { usage, finish_reason: "stop".into(), email: None });
-        assert_eq!(out.len(), 2, "Done 應產 2 chunk：最終 + [DONE]");
+        assert_eq!(out.len(), 2, "Done should emit final chunk plus [DONE]");
         assert_eq!(out[1], "data: [DONE]\n\n");
 
         let final_chunk = parse_chunk_payload(&out[0]);
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(item["type"], "function");
         assert_eq!(item["function"]["name"], "Bash");
         // arguments 須是 JSON 字串（OpenAI 規範），而非物件
-        let args_str = item["function"]["arguments"].as_str().expect("arguments 應為字串");
+        let args_str = item["function"]["arguments"].as_str().expect("arguments should be a string");
         let args: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args["cmd"], "ls");
         assert_eq!(args["n"], 2);

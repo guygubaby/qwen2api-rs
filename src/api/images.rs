@@ -24,7 +24,7 @@ pub async fn generate(
 ) -> Response {
     let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return AppError::BadRequest(format!("JSON 解析錯誤: {e}")).into_response(),
+        Err(e) => return AppError::BadRequest(format!("JSON parse error: {e}")).into_response(),
     };
     let caller = match resolve_auth(&state, &headers, &query).await {
         Ok(a) => Some(a.token),
@@ -84,7 +84,7 @@ pub async fn generate(
     }
 
     if data_items.is_empty() {
-        let msg = last_err.unwrap_or_else(|| "未生成图片（上游未返回图片 URL）".into());
+        let msg = last_err.unwrap_or_else(|| "No image was generated; upstream did not return an image URL".into());
         return AppError::Upstream(msg).into_response();
     }
 

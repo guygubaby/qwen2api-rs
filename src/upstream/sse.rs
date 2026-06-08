@@ -110,7 +110,7 @@ pub fn parse_sse_chunk(chunk: &str) -> Vec<QwenDelta> {
     out
 }
 
-/// 偵測上游明確 JSON 錯誤（{"success":false} 或 {"error":...}），回錯誤訊息。
+/// Detect explicit upstream JSON errors and return a formatted error message.
 pub fn extract_upstream_error(text: &str) -> Option<String> {
     for raw_line in text.lines() {
         let mut line = raw_line.trim();
@@ -279,7 +279,7 @@ mod tests {
             "usage": { "prompt_tokens": 7, "completion_tokens": 11 }
         }));
         let v = parse_sse_chunk(&c);
-        let usage = v[0].usage.as_ref().expect("usage 必有");
+        let usage = v[0].usage.as_ref().expect("usage should exist");
         assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_i64()), Some(7));
         assert_eq!(usage.get("completion_tokens").and_then(|v| v.as_i64()), Some(11));
     }
@@ -308,17 +308,17 @@ mod tests {
     #[test]
     fn extract_error_handles_success_false() {
         let s = r#"data: {"success":false,"request_id":"req-1","data":{"code":"rate_limit","details":"too fast"}}"#;
-        let err = extract_upstream_error(s).expect("應偵測到錯誤");
-        assert!(err.contains("rate_limit"), "缺 code: {err}");
-        assert!(err.contains("req-1"), "缺 request_id: {err}");
-        assert!(err.contains("too fast"), "缺 details: {err}");
+        let err = extract_upstream_error(s).expect("error should be detected");
+        assert!(err.contains("rate_limit"), "missing code: {err}");
+        assert!(err.contains("req-1"), "missing request_id: {err}");
+        assert!(err.contains("too fast"), "missing details: {err}");
     }
 
     /// 錯誤格式 2：`{"error":{code, message}}` → 同樣格式化。
     #[test]
     fn extract_error_handles_error_object() {
         let s = r#"data: {"error":{"code":"auth_error","message":"invalid token"}}"#;
-        let err = extract_upstream_error(s).expect("應偵測到錯誤");
+        let err = extract_upstream_error(s).expect("error should be detected");
         assert!(err.contains("auth_error"));
         assert!(err.contains("invalid token"));
     }
@@ -328,10 +328,10 @@ mod tests {
     #[test]
     fn meaningful_content_detection() {
         let empty = QwenDelta::default();
-        assert!(!delta_has_meaningful_content(&empty), "空 delta 應為 false");
+        assert!(!delta_has_meaningful_content(&empty), "empty delta should be false");
 
         let only_phase = QwenDelta { phase: "answer".into(), ..Default::default() };
-        assert!(!delta_has_meaningful_content(&only_phase), "只有 phase 沒文字應為 false");
+        assert!(!delta_has_meaningful_content(&only_phase), "phase-only delta should be false");
 
         let with_content = QwenDelta { content: "hi".into(), ..Default::default() };
         assert!(delta_has_meaningful_content(&with_content));
@@ -342,7 +342,7 @@ mod tests {
         let with_cumul_reasoning = QwenDelta { reasoning_cumulative: Some("acc".into()), ..Default::default() };
         assert!(delta_has_meaningful_content(&with_cumul_reasoning));
 
-        // cumulative=Some("") 也應視為空（防止上游送 "" 仍被誤判為有內容）
+        // cumulative=Some("") should be treated as empty.
         let empty_cumul = QwenDelta { reasoning_cumulative: Some("".into()), ..Default::default() };
         assert!(!delta_has_meaningful_content(&empty_cumul));
     }

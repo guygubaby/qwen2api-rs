@@ -63,7 +63,7 @@ impl Stats {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Err(e) = init_schema(&db_path) {
-            tracing::error!("[stats] 初始化資料庫失敗 {:?}: {e}", db_path);
+            tracing::error!("[stats] database initialization failed {:?}: {e}", db_path);
         }
 
         let (tx, rx) = sync_channel::<RequestRecord>(CHANNEL_CAP);
@@ -74,7 +74,7 @@ impl Stats {
             .name("stats-writer".into())
             .spawn(move || writer_loop(writer_path, rx))
         {
-            tracing::error!("[stats] 啟動寫入執行緒失敗: {e}");
+            tracing::error!("[stats] failed to start writer thread: {e}");
         }
 
         Arc::new(Stats { tx, db_path, dropped })
@@ -87,7 +87,7 @@ impl Stats {
             Err(TrySendError::Full(_)) => {
                 let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n % 100 == 1 {
-                    tracing::warn!("[stats] 寫入通道已滿，累計丟棄 {n} 筆統計（不影響請求）");
+                    tracing::warn!("[stats] writer channel is full; dropped {n} stats records without affecting requests");
                 }
             }
             Err(TrySendError::Disconnected(_)) => {}
@@ -145,7 +145,7 @@ fn writer_loop(path: PathBuf, rx: Receiver<RequestRecord>) {
     let mut conn = match open_conn(&path) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("[stats] 寫入執行緒開連線失敗: {e}");
+            tracing::error!("[stats] writer thread failed to open connection: {e}");
             return;
         }
     };
@@ -163,7 +163,7 @@ fn writer_loop(path: PathBuf, rx: Receiver<RequestRecord>) {
             }
         }
         if let Err(e) = insert_batch(&mut conn, &batch) {
-            tracing::error!("[stats] 批次寫入失敗（{} 筆）: {e}", batch.len());
+            tracing::error!("[stats] batch insert failed ({} records): {e}", batch.len());
         }
     }
 }

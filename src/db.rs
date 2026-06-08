@@ -1,5 +1,5 @@
 //! 帶鎖的 JSON 檔案存儲，對應 Python `core/database.py` 的 AsyncJsonDB。
-//! 泛型化：可存 Vec<Value>、Vec<User>、ApiKeysFile 等。寫入採臨時檔 + rename 原子替換。
+//! 泛型化 JSON store. Writes use a temporary file + rename for atomic replacement.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -19,7 +19,7 @@ pub async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) {
                 let _ = tokio::fs::rename(&tmp, path).await;
             }
         }
-        Err(e) => tracing::error!("write_json_atomic 序列化失敗: {e}"),
+        Err(e) => tracing::error!("write_json_atomic serialization failed: {e}"),
     }
 }
 
@@ -44,7 +44,7 @@ impl<T> JsonDb<T>
 where
     T: Serialize + DeserializeOwned + Clone + Send + 'static,
 {
-    /// 載入檔案；不存在或解析失敗則用 default，並寫回一份。
+    /// 載入檔案；不存在或parse failed則用 default，並寫回一份。
     pub async fn load(path: impl AsRef<Path>, default: T) -> Self {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -54,7 +54,7 @@ where
             Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!("JsonDb 解析失敗 {:?}: {e}，使用預設值", path);
+                    tracing::warn!("JsonDb parse failed {:?}: {e}, using default value", path);
                     default
                 }
             },
@@ -107,14 +107,14 @@ where
             Ok(bytes) => {
                 let tmp = self.path.with_extension("json.tmp");
                 if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
-                    tracing::error!("JsonDb 寫入臨時檔失敗 {:?}: {e}", tmp);
+                    tracing::error!("JsonDb temporary file write failed {:?}: {e}", tmp);
                     return;
                 }
                 if let Err(e) = tokio::fs::rename(&tmp, &self.path).await {
-                    tracing::error!("JsonDb rename 失敗 {:?}: {e}", self.path);
+                    tracing::error!("JsonDb rename failed {:?}: {e}", self.path);
                 }
             }
-            Err(e) => tracing::error!("JsonDb 序列化失敗: {e}"),
+            Err(e) => tracing::error!("JsonDb serialization failed: {e}"),
         }
     }
 }

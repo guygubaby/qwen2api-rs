@@ -3,19 +3,9 @@ services:
     build: .
     image: qwen2api-rs:latest
     container_name: qwen2api-rs
-    ports:
-      - "7860:7860"
-    volumes:
-      # 帳號/金鑰/上傳檔案等持久化資料；可直接沿用原 Python 版的 data/ 內容
-      - ./data:/app/data
-    environment:
-      ADMIN_KEY: "change-me-now"        # 管理台金鑰，務必修改
-      PORT: "7860"
-      LOG_LEVEL: "info"
-      MAX_INFLIGHT_PER_ACCOUNT: "2"
-      MAX_RETRIES: "3"
-      ACCOUNT_MIN_INTERVAL_MS: "3000"   # 風控：同帳號最小間隔(毫秒)，0=不限
-      CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: "5"
-      CHAT_ID_PREWARM_MAX_ACCOUNTS: "8"
-      DEFAULT_MODEL: "qwen3.7-plus"
     restart: unless-stopped
+    env_file:
+      - .env
+    network_mode: host
+    volumes:
+      - ./data:/app/data

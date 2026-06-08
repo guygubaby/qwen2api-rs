@@ -216,9 +216,9 @@ impl AccountPool {
         }
         let arc = Arc::new(pool);
         tracing::info!(
-            "帳號池已載入 {} 個帳號（Ready-Set 索引: {}）",
+            "account pool loaded {} accounts (Ready-Set index: {})",
             arc.count().await,
-            if use_index { "開" } else { "關" }
+            if use_index { "on" } else { "off" }
         );
         arc
     }
@@ -454,7 +454,7 @@ impl AccountPool {
         let jitter = jitter_ms(self.jitter_min_ms, self.jitter_max_ms) as f64 / 1000.0;
 
         let PoolState { accounts, idx, global_in_use, .. } = st;
-        let idx = idx.as_mut().expect("use_index 時 idx 必為 Some");
+        let idx = idx.as_mut().expect("use_index requires idx to be Some");
 
         // 1) 將到期的 cooldown 帳號移回（lazy：以 loc 為準，並依即時狀態重新放置）。
         while let Some(Reverse((key, _))) = idx.cooldown.peek() {
@@ -503,7 +503,7 @@ impl AccountPool {
         let email = chosen?;
 
         // 3) 佔用（欄位寫入 + 索引重置同臨界區，無 TOCTOU）。
-        let &pos = idx.pos.get(&email).expect("chosen email 必有 pos");
+        let &pos = idx.pos.get(&email).expect("chosen email must have a pos");
         let token = {
             let acc = &mut accounts[pos];
             acc.inflight += 1;
@@ -850,7 +850,7 @@ mod tests {
     }
 
     /// 同一批帳號狀態下，索引版與掃描版「能取出的帳號數」必須一致（min_interval=0，避免冷卻時間干擾）。
-    /// 並驗證每次取出的帳號都合法（valid && inflight<cap），且絕不重複超過 cap。
+    /// 並驗證每次取出的帳號都合法（valid && inflight<cap），且絕不重複exceeded cap。
     #[test]
     fn parity_and_validity_no_interval() {
         // 構造多樣狀態：valid/invalid、不同 inflight、限流中/已過期。
@@ -875,20 +875,20 @@ mod tests {
                 // 取出者必須合法
                 let pos = st.accounts.iter().position(|a| a.email == h.email).unwrap();
                 let a = &st.accounts[pos];
-                assert!(a.valid, "取出失效帳號 {}", h.email);
-                assert!(a.inflight <= cap, "超過 cap: {} inflight={}", h.email, a.inflight);
-                assert!(a.rate_limited_until <= now_secs(), "取出限流帳號 {}", h.email);
+                assert!(a.valid, "selected invalid account {}", h.email);
+                assert!(a.inflight <= cap, "exceeded cap: {} inflight={}", h.email, a.inflight);
+                assert!(a.rate_limited_until <= now_secs(), "selected rate-limited account {}", h.email);
                 n += 1;
-                assert!(n < 1000, "疑似無限迴圈");
+                assert!(n < 1000, "possible infinite loop");
             }
             n
         };
 
         let n_idx = drain(true);
         let n_scan = drain(false);
-        assert_eq!(n_idx, n_scan, "索引版與掃描版可取數不一致");
+        assert_eq!(n_idx, n_scan, "indexed and scan implementations selected different counts");
         // a,b,g 各可取 2 次(cap)，e 可取 1 次(已 inflight=1)，f 已滿 → 2+2+2+1 = 7
-        assert_eq!(n_scan, 7, "預期可取 7 次");
+        assert_eq!(n_scan, 7, "expected 7 acquisitions");
     }
 
     /// min_interval>0 時：取一次後帳號進入 cooldown，立即再取應取不到該帳號（風控不變）。
@@ -899,9 +899,9 @@ mod tests {
         let mut st = pool.state.try_lock().unwrap();
         let ex = HashSet::new();
         let first = pool.acquire_locked(&mut st, None, &ex);
-        assert!(first.is_some(), "首次應取得");
+        assert!(first.is_some(), "first acquire should succeed");
         let second = pool.acquire_locked(&mut st, None, &ex);
-        assert!(second.is_none(), "min_interval 內不應再取得同一帳號");
+        assert!(second.is_none(), "same account should not be acquired within min_interval");
     }
 
     /// exclude 全部命中時應落空而非無限迴圈，且未被排除者仍可取。
@@ -938,10 +938,10 @@ mod tests {
         {
             let st = pool.state.lock().await;
             let a = &st.accounts[account_pos(&st, "t").unwrap()];
-            assert_eq!(a.last_error, "upstream 401 X", "last_error 必寫入");
+            assert_eq!(a.last_error, "upstream 401 X", "last_error must be written");
             assert_eq!(a.status_code, "auth_error");
             assert_eq!(a.consecutive_failures, 1);
-            assert!(a.valid, "未達門檻不應立即失效");
+            assert!(a.valid, "should remain valid before threshold");
         }
 
         // 第 2 次：failures=2 仍 valid。
@@ -950,8 +950,8 @@ mod tests {
             let st = pool.state.lock().await;
             let a = &st.accounts[account_pos(&st, "t").unwrap()];
             assert_eq!(a.consecutive_failures, 2);
-            assert!(a.valid, "第 2 次仍未達門檻");
-            assert_eq!(a.last_error, "upstream 401 Y", "last_error 覆寫為最新");
+            assert!(a.valid, "second failure is still below threshold");
+            assert_eq!(a.last_error, "upstream 401 Y", "last_error should be overwritten with latest error");
         }
 
         // 第 3 次：達門檻 → valid=false。
@@ -960,7 +960,7 @@ mod tests {
             let st = pool.state.lock().await;
             let a = &st.accounts[account_pos(&st, "t").unwrap()];
             assert_eq!(a.consecutive_failures, 3);
-            assert!(!a.valid, "達門檻應永久失效");
+            assert!(!a.valid, "threshold should mark account invalid");
         }
 
         // mark_success 應重置 failures（驗證「真死/瞬時」可區分）。
@@ -973,12 +973,12 @@ mod tests {
         }
 
         // 非 auth_error reason 必須立即失效（pending_activation 不該享受門檻）。
-        pool.mark_invalid("t", "pending_activation", "尚未激活").await;
+        pool.mark_invalid("t", "pending_activation", "not activated").await;
         {
             let st = pool.state.lock().await;
             let a = &st.accounts[account_pos(&st, "t").unwrap()];
-            assert!(!a.valid, "pending_activation 應立即失效");
-            assert!(a.activation_pending, "activation_pending 旗標必設");
+            assert!(!a.valid, "pending_activation should invalidate immediately");
+            assert!(a.activation_pending, "activation_pending flag should be set");
         }
     }
 
@@ -994,7 +994,7 @@ mod tests {
             let a = &mut st.accounts[pos];
             a.valid = false;
             a.status_code = "auth_error".to_string();
-            a.last_error = "舊上游 401 訊息".to_string();
+            a.last_error = "old upstream 401 message".to_string();
             a.consecutive_failures = 2;
             a.rate_limit_strikes = 1;
             a.activation_pending = true;
@@ -1007,12 +1007,12 @@ mod tests {
         let st = pool.state.lock().await;
         let a = &st.accounts[account_pos(&st, "r").unwrap()];
         assert_eq!(a.token, "NEW_209_CHAR_JWT");
-        assert!(a.valid, "valid 必還原");
+        assert!(a.valid, "valid should be restored");
         assert_eq!(a.status_code, "valid");
-        assert_eq!(a.last_error, "", "last_error 必清");
-        assert_eq!(a.consecutive_failures, 0, "failures 必歸零");
-        assert_eq!(a.rate_limit_strikes, 0, "rate_limit_strikes 必歸零");
-        assert!(!a.activation_pending, "activation_pending 必清");
+        assert_eq!(a.last_error, "", "last_error should be cleared");
+        assert_eq!(a.consecutive_failures, 0, "failures should reset");
+        assert_eq!(a.rate_limit_strikes, 0, "rate_limit_strikes should reset");
+        assert!(!a.activation_pending, "activation_pending should be cleared");
     }
 
     /// replace_token 對不存在的 email 應回 false 且不 panic。
@@ -1053,10 +1053,10 @@ mod tests {
         let Some(idx) = st.idx.as_ref() else { return };
         let cap = st.max_inflight_per_account;
         // pos 正確且與帳號數一致
-        assert_eq!(idx.pos.len(), st.accounts.len(), "pos 數量不符");
+        assert_eq!(idx.pos.len(), st.accounts.len(), "pos count mismatch");
         for (email, &pos) in &idx.pos {
-            assert!(pos < st.accounts.len(), "pos 越界");
-            assert_eq!(&st.accounts[pos].email, email, "pos 指向錯帳號");
+            assert!(pos < st.accounts.len(), "pos out of bounds");
+            assert_eq!(&st.accounts[pos].email, email, "pos points to wrong account");
         }
         // loc 必須等於依即時狀態算出的期望（任何遺漏 reindex 都會被抓到）
         for a in &st.accounts {
@@ -1067,14 +1067,14 @@ mod tests {
             } else {
                 Loc::Cooldown
             };
-            assert_eq!(idx.loc.get(&a.email).copied(), Some(expected), "{} loc 不一致", a.email);
+            assert_eq!(idx.loc.get(&a.email).copied(), Some(expected), "{} loc mismatch", a.email);
         }
         // ready 堆中 loc 仍為 Ready 者，必須真的可取
         for Reverse((_, _, email)) in &idx.ready {
             if idx.loc.get(email) == Some(&Loc::Ready) {
                 let pos = idx.pos[email];
                 let a = &st.accounts[pos];
-                assert!(a.valid && a.is_available(min_ms) && a.inflight < cap, "ready 含不可用帳號 {email}");
+                assert!(a.valid && a.is_available(min_ms) && a.inflight < cap, "ready contains unavailable account {email}");
             }
         }
     }
@@ -1101,7 +1101,7 @@ mod tests {
                     if let Some(h) = pool.acquire_locked(&mut st, None, &ex) {
                         let pos = account_pos(&st, &h.email).unwrap();
                         let a = &st.accounts[pos];
-                        assert!(a.valid && a.inflight <= cap, "取出非法帳號 {}", h.email);
+                        assert!(a.valid && a.inflight <= cap, "selected illegal account {}", h.email);
                         held.push(h.email);
                     }
                 }
@@ -1132,7 +1132,7 @@ mod tests {
             }
             let st = pool.state.lock().await;
             check_consistency(&st, min_ms);
-            assert_eq!(st.global_in_use, held.len() as i64, "global_in_use 與持有數不符");
+            assert_eq!(st.global_in_use, held.len() as i64, "global_in_use does not match held count");
         }
     }
 
@@ -1148,6 +1148,6 @@ mod tests {
         let mut st = pool.state.try_lock().unwrap();
         let ex = HashSet::new();
         let h = pool.acquire_locked(&mut st, None, &ex);
-        assert_eq!(h.map(|h| h.email), Some("b".to_string()), "應選 inflight 最少的 b");
+        assert_eq!(h.map(|h| h.email), Some("b".to_string()), "should select b with the lowest inflight");
     }
 }

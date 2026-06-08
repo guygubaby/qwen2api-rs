@@ -1,4 +1,4 @@
-//! 健康/就緒探針，對應 Python `api/probes.py`。
+//! Health/readiness probes.
 
 use crate::state::AppState;
 use axum::extract::State;

@@ -1,5 +1,5 @@
-//! qwen2api-rs 入口：axum 應用組裝、生命週期、路由掛載。
-// 專案保留了部分供未來上游同步使用的欄位/方法（見 dev/UPSTREAM.md），故放寬 dead_code。
+//! qwen2api-rs entrypoint: axum app assembly, lifecycle, and routes.
+// Some fields/methods are kept for future upstream sync work, so dead_code is relaxed.
 #![allow(dead_code)]
 
 mod account;
@@ -24,28 +24,7 @@ use config::Settings;
 use state::AppStateInner;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
-
-fn admin_router() -> Router<state::AppState> {
-    Router::new()
-        .route("/status", get(api::admin::status))
-        .route("/accounts", get(api::admin::list_accounts).post(api::admin::add_account))
-        .route("/accounts/register", post(api::admin::register_account))
-        .route("/accounts/{email}", delete(api::admin::delete_account))
-        .route("/accounts/{email}/verify", post(api::admin::verify_account))
-        .route("/accounts/{email}/resign", post(api::admin::resign_account))
-        .route("/accounts/{email}/activate", post(api::admin::activate_account))
-        .route("/verify", post(api::admin::verify_all))
-        .route("/resign_all", post(api::admin::resign_all))
-        .route("/accounts/exp_summary", get(api::admin::accounts_exp_summary))
-        .route("/keys", get(api::admin::get_keys).post(api::admin::create_key))
-        .route("/keys/{key}", delete(api::admin::delete_key))
-        .route("/settings", get(api::admin::get_settings).put(api::admin::update_settings))
-        .route("/users", get(api::admin::list_users).post(api::admin::create_user))
-        .route("/stats", get(api::admin::stats))
-        .route("/stats/recent", get(api::admin::stats_recent))
-        .route("/media/tasks", get(api::admin::media_tasks).post(api::admin::media_submit))
-}
+use tower_http::services::ServeDir;
 
 #[tokio::main]
 async fn main() {
@@ -59,20 +38,18 @@ async fn main() {
         )
         .init();
 
-    tracing::info!("正在啟動 qwen2API Rust 企業網關 ...");
+    tracing::info!("Starting qwen2api-rs gateway ...");
     let port = settings.port;
-    let web_dir = std::env::var("WEB_DIR").unwrap_or_else(|_| "web".to_string());
 
     let state = AppStateInner::new(settings).await;
 
-    // 啟動 chat_id 預熱池
+    // Start the chat_id prewarm pool.
     state.chat_id_pool.start();
 
-    // 啟動媒體任務佇列背景 worker（圖片/影片生成 + 本地保存）
+    // Start the media queue worker for image/video generation and local backups.
     state.media_queue.clone().start(state.clone());
 
-    // Pillar 3：連線保活（opt-in，預設關）。閒置時定期輕量 ping 上游，保溫一條連線，
-    // 免去 idle>30s 連線池回收後首請求重握 TLS（經風控代理時握手更貴）。風控敏感故預設關閉。
+    // Optional connection keepalive. Disabled by default because upstream risk controls can be sensitive.
     if state.settings.conn_keepalive_seconds > 0 {
         let state3 = state.clone();
         let interval = state.settings.conn_keepalive_seconds;
@@ -84,12 +61,10 @@ async fn main() {
                 }
             }
         });
-        tracing::info!("連線保活已啟用：每 {interval}s 保溫一條上游連線");
+        tracing::info!("Connection keepalive enabled: ping upstream every {interval}s");
     }
 
-    // Token refresh worker：自動 refresh 即將過期的 chat.qwen.ai JWT。
-    // 解決 16,857 個 token 集中過期（同批註冊 → exp 集中）的災難。
-    // 細節見 memory `reference-qwen-signin-protocol`。設 INTERVAL=0 可停用。
+    // Token refresh worker: refresh chat.qwen.ai JWTs before they expire.
     if state.settings.token_refresh_interval_hours > 0 {
         let state_w = state.clone();
         let interval_secs = state.settings.token_refresh_interval_hours * 3600;
@@ -98,7 +73,7 @@ async fn main() {
         let jmin = state.settings.token_refresh_jitter_min_ms;
         let jmax = state.settings.token_refresh_jitter_max_ms.max(jmin);
         tokio::spawn(async move {
-            // 啟動延遲 30s，避開 cold start
+            // Delay startup work so cold start stays light.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             loop {
                 let cycle_start = std::time::Instant::now();
@@ -106,7 +81,7 @@ async fn main() {
                 let cutoff = now + ahead_days * 86400;
                 let accounts = state_w.pool.list().await;
                 let total = accounts.len();
-                // 篩選：有 password + JWT exp <= cutoff（不解 JWT 失敗的略過，避免污染 stats）
+                // Select accounts with a password and a JWT expiring before the cutoff.
                 let mut due: Vec<(String, String)> = accounts
                     .into_iter()
                     .filter(|a| !a.password.is_empty() && !a.token.is_empty())
@@ -119,7 +94,7 @@ async fn main() {
                     due.truncate(batch);
                 }
                 tracing::info!(
-                    "[refresh-worker] 掃描 {total} 帳號；{due_total} 個於 {ahead_days} 天內到期；本輪處理 {}",
+                    "[refresh-worker] scanned {total} accounts; {due_total} expire within {ahead_days} days; processing {} this round",
                     due.len()
                 );
                 let mut ok_n = 0usize;
@@ -134,7 +109,7 @@ async fn main() {
                             fail_n += 1;
                             let msg = e.to_string();
                             state_w.pool.apply_verify(&email, false, "auth_error", &msg).await;
-                            tracing::warn!("[refresh-worker] {email} refresh 失敗: {msg}");
+                            tracing::warn!("[refresh-worker] {email} refresh failed: {msg}");
                         }
                     }
                     let span = jmax.saturating_sub(jmin).max(1);
@@ -142,7 +117,7 @@ async fn main() {
                     tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
                 }
                 tracing::info!(
-                    "[refresh-worker] 本輪完成 ok={ok_n} fail={fail_n} 耗時={:?}；睡 {} 小時",
+                    "[refresh-worker] round finished ok={ok_n} fail={fail_n} elapsed={:?}; sleeping {}h",
                     cycle_start.elapsed(),
                     interval_secs / 3600
                 );
@@ -150,19 +125,19 @@ async fn main() {
             }
         });
         tracing::info!(
-            "Token refresh worker 啟用：每 {}h 跑、提前 {ahead_days}d 刷、每輪上限 {batch}、jitter {jmin}-{jmax}ms",
+            "Token refresh worker enabled: interval={}h ahead={ahead_days}d batch={batch} jitter={jmin}-{jmax}ms",
             state.settings.token_refresh_interval_hours
         );
     }
 
-    // 嘗試動態抓上游模型列表，更新預設模型（best-effort）
+    // Best-effort upstream model cache warmup.
     {
         let state2 = state.clone();
         tokio::spawn(async move {
             if let Some(token) = state2.pool.any_valid_token().await {
                 let models = state2.client.list_models(&token).await;
                 if let Some(first) = models.first().and_then(|m| m.get("id")).and_then(|v| v.as_str()) {
-                    tracing::info!("上游現役模型樣本: {first}");
+                    tracing::info!("Sample upstream model: {first}");
                 }
                 let mut cache = state2.upstream_models.write().await;
                 cache.data = models;
@@ -171,17 +146,8 @@ async fn main() {
         });
     }
 
-    // 生成媒體本地檔案（圖片/影片）以 /media/{file} 對外（UUID 檔名，瀏覽器可直接顯示）
+    // Generated media is served from /media/{file}.
     let media_service = ServeDir::new(state.settings.media_dir.clone());
-
-    let index = format!("{web_dir}/index.html");
-    // 靜態資源不快取，確保管理台更新後立即生效
-    let static_service = tower::ServiceBuilder::new()
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-        ))
-        .service(ServeDir::new(&web_dir).not_found_service(ServeFile::new(index)));
 
     let app = Router::new()
         // OpenAI Chat Completions
@@ -197,7 +163,7 @@ async fn main() {
         .route("/v1/messages/count_tokens", post(api::anthropic::count_tokens))
         .route("/messages/count_tokens", post(api::anthropic::count_tokens))
         .route("/anthropic/v1/messages/count_tokens", post(api::anthropic::count_tokens))
-        // Gemini（路徑含 {model}:{action}；與 GET /v1/models/{model_id} 共用參數名以合併方法）
+        // Gemini paths include {model}:{action}.
         .route("/v1beta/models/{model_id}", post(api::gemini::generate))
         .route("/models/{model_id}", post(api::gemini::generate))
         .route("/v1/models/{model_id}", post(api::gemini::generate))
@@ -216,18 +182,17 @@ async fn main() {
         // Models
         .route("/v1/models", get(api::models::list_models))
         .route("/v1/models/{model_id}", get(api::models::get_model))
-        // 探針
+        // Probes and JSON root.
+        .route("/", get(api::probes::root))
         .route("/healthz", get(api::probes::healthz))
         .route("/readyz", get(api::probes::readyz))
         .route("/api", get(api::probes::root))
-        .nest("/api/admin", admin_router())
         .nest_service("/media", media_service)
-        .fallback_service(static_service)
         .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("綁定埠失敗");
-    tracing::info!("✅ 已啟動，監聽 http://0.0.0.0:{port}  WebUI: http://127.0.0.1:{port}/");
-    axum::serve(listener, app).await.expect("server 錯誤");
+    let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind port");
+    tracing::info!("qwen2api-rs is listening on http://0.0.0.0:{port}");
+    axum::serve(listener, app).await.expect("server error");
 }

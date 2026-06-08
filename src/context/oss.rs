@@ -121,16 +121,16 @@ pub async fn upload_file(
                     sts = Some(v);
                     break;
                 }
-                Err(e) => last_err = format!("解析失敗: {e}"),
+                Err(e) => last_err = format!("parse failed: {e}"),
             },
-            Err(e) => last_err = format!("連線失敗: {e}"),
+            Err(e) => last_err = format!("connection failed: {e}"),
         }
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(300 * (attempt + 1))).await;
         }
     }
     let sts = sts.ok_or_else(|| AppError::Upstream(format!("getstsToken {last_err}")))?;
-    let d = sts.get("data").ok_or_else(|| AppError::Upstream("getstsToken 缺 data".into()))?;
+    let d = sts.get("data").ok_or_else(|| AppError::Upstream("getstsToken response missing data".into()))?;
     let ak = d.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("");
     let sk = d.get("access_key_secret").and_then(|v| v.as_str()).unwrap_or("");
     let stoken = d.get("security_token").and_then(|v| v.as_str()).unwrap_or("");
@@ -142,7 +142,7 @@ pub async fn upload_file(
     let region = region_raw.strip_prefix("oss-").unwrap_or(region_raw);
 
     if ak.is_empty() || bucket.is_empty() || file_path.is_empty() {
-        return Err(AppError::Upstream("getstsToken 回應缺欄位".into()));
+        return Err(AppError::Upstream("getstsToken response missing required fields".into()));
     }
 
     // 2) PUT 到 OSS（V4 簽名）
@@ -161,11 +161,11 @@ pub async fn upload_file(
         .body(bytes.to_vec())
         .send()
         .await
-        .map_err(|e| AppError::Upstream(format!("OSS PUT 連線失敗: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("OSS PUT connection failed: {e}")))?;
     if !put_resp.status().is_success() {
         let st = put_resp.status();
         let body = put_resp.text().await.unwrap_or_default();
-        return Err(AppError::Upstream(format!("OSS PUT 失敗 {st}: {}", body.chars().take(200).collect::<String>())));
+        return Err(AppError::Upstream(format!("OSS PUT failed {st}: {}", body.chars().take(200).collect::<String>())));
     }
 
     // 3) parse
@@ -194,13 +194,13 @@ pub async fn upload_file(
                 break;
             }
             if s == "failed" || s == "error" {
-                return Err(AppError::Upstream(format!("檔案解析失敗 status={s}")));
+                return Err(AppError::Upstream(format!("File parse failed status={s}")));
             }
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
 
-    // 5) 組 remote_ref
+    // 5) Build remote_ref.
     let ms = now_millis();
     let user_id = file_path.split('/').next().unwrap_or("");
     let url = format!("https://{bucket}.{endpoint}/{file_path}");

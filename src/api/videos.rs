@@ -24,7 +24,7 @@ pub async fn generate(
 ) -> Response {
     let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return AppError::BadRequest(format!("JSON 解析錯誤: {e}")).into_response(),
+        Err(e) => return AppError::BadRequest(format!("JSON parse error: {e}")).into_response(),
     };
     let caller = match resolve_auth(&state, &headers, &query).await {
         Ok(a) => Some(a.token),
@@ -54,7 +54,7 @@ pub async fn generate(
 
     if out.urls.is_empty() {
         return AppError::Upstream(out.error.unwrap_or_else(|| {
-            "影片生成失敗（已輪換多個帳號，可能全部額度不足）".into()
+            "Video generation failed after rotating accounts; all accounts may be out of quota".into()
         }))
         .into_response();
     }

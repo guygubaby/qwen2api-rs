@@ -129,13 +129,13 @@ impl Account {
 
     pub fn get_status_text(&self) -> String {
         match self.get_status_code().as_str() {
-            "valid" => "正常",
-            "pending_activation" => "待激活",
-            "rate_limited" => "限流",
-            "banned" => "封禁",
-            "auth_error" => "鉴权失败",
-            "invalid" => "失效",
-            _ => "未知",
+            "valid" => "Healthy",
+            "pending_activation" => "Pending activation",
+            "rate_limited" => "Rate limited",
+            "banned" => "Banned",
+            "auth_error" => "Authentication failed",
+            "invalid" => "Invalid",
+            _ => "Unknown",
         }
         .to_string()
     }

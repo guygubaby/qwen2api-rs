@@ -22,7 +22,7 @@ pub async fn chat_completions(
 ) -> Response {
     let body: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return AppError::BadRequest(format!("JSON 解析錯誤: {e}")).into_response(),
+        Err(e) => return AppError::BadRequest(format!("JSON parse error: {e}")).into_response(),
     };
     let auth = match resolve_auth(&state, &headers, &query).await {
         Ok(a) => a,

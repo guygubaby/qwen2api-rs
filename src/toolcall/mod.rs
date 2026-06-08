@@ -112,6 +112,10 @@ pub fn build_tool_instruction_block(tools: &[NormalizedTool], _client_profile: &
 static RE_TOOL_OPEN: Lazy<Regex> = Lazy::new(|| Regex::new(r"<tool_call>").unwrap());
 static RE_FENCE_OPEN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"```(?:tool_call|json)?[ \t]*\n?").unwrap());
+static RE_FUNCTION_OPEN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"<function\s*=\s*"?([A-Za-z0-9_.:-]+)"?\s*>"#).unwrap());
+static RE_PARAMETER_OPEN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"<parameter\s*=\s*"?([A-Za-z0-9_.:-]+)"?\s*>"#).unwrap());
 
 /// 從某個 `{` 位置（byte index）出發，做 brace-balanced 掃描，回傳該 JSON 物件
 /// 結束位置（含末尾 `}`）的 byte index。會正確處理字串字面值中的 `{`/`}`/`\"`/反斜線跳脫。
@@ -220,6 +224,31 @@ fn find_tool_blocks(text: &str) -> Vec<(usize, usize, usize, usize)> {
     blocks
 }
 
+fn find_function_blocks(text: &str) -> Vec<(usize, usize, usize, usize, String)> {
+    let bytes = text.as_bytes();
+    let opens: Vec<(usize, usize, String)> = RE_FUNCTION_OPEN
+        .captures_iter(text)
+        .filter_map(|caps| {
+            let m = caps.get(0)?;
+            let name = caps.get(1)?.as_str().to_string();
+            Some((m.start(), m.end(), name))
+        })
+        .collect();
+
+    let mut blocks = Vec::new();
+    for (idx, (open_start, inner_start, name)) in opens.iter().enumerate() {
+        let limit = opens.get(idx + 1).map(|(start, _, _)| *start).unwrap_or(text.len());
+        let mut inner_end = limit;
+        let mut block_end = limit;
+        if let Some(rel) = find_subslice(&bytes[*inner_start..limit], b"</function>") {
+            inner_end = *inner_start + rel;
+            block_end = inner_end + b"</function>".len();
+        }
+        blocks.push((*open_start, block_end, *inner_start, inner_end, name.clone()));
+    }
+    blocks
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -241,6 +270,7 @@ pub fn parse_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<P
     let bytes = text.as_bytes();
     let mut calls = Vec::new();
     let blocks = find_tool_blocks(text);
+    let function_blocks = find_function_blocks(text);
     for (_, _, inner_start, inner_end) in &blocks {
         for (s, e) in split_json_objects(bytes, *inner_start, *inner_end) {
             let slice = match std::str::from_utf8(&bytes[s..=e]) {
@@ -252,12 +282,54 @@ pub fn parse_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<P
             }
         }
     }
+    for (_, _, inner_start, inner_end, raw_name) in &function_blocks {
+        let body = &text[*inner_start..*inner_end];
+        if let Some(c) = parse_function_block(raw_name, body, registry) {
+            calls.push(c);
+        }
+    }
     // 沒抓到任何 <tool_call> / 圍欄區塊 → 嘗試裸 JSON fallback。
     // 只在 has_tools=true（registry 非空）才掃，避免無工具情境下誤判 JSON 文字。
-    if blocks.is_empty() && !registry.is_empty() {
+    if blocks.is_empty() && function_blocks.is_empty() && !registry.is_empty() {
         calls.extend(parse_naked_json_tool_calls(text, registry));
     }
     calls
+}
+
+fn parse_function_block(
+    raw_name: &str,
+    body: &str,
+    registry: &HashMap<String, String>,
+) -> Option<ParsedToolCall> {
+    let canonical = registry
+        .get(&norm_key(raw_name))
+        .cloned()
+        .unwrap_or_else(|| raw_name.to_string());
+    let params: Vec<(usize, usize, String)> = RE_PARAMETER_OPEN
+        .captures_iter(body)
+        .filter_map(|caps| {
+            let m = caps.get(0)?;
+            let name = caps.get(1)?.as_str().to_string();
+            Some((m.start(), m.end(), name))
+        })
+        .collect();
+
+    let mut args = serde_json::Map::new();
+    for (idx, (_, value_start, name)) in params.iter().enumerate() {
+        let value_end = params.get(idx + 1).map(|(start, _, _)| *start).unwrap_or(body.len());
+        let mut raw = body[*value_start..value_end].trim();
+        if let Some(close_pos) = raw.find("</parameter>") {
+            raw = raw[..close_pos].trim();
+        }
+        let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        args.insert(name.clone(), value);
+    }
+
+    Some(ParsedToolCall {
+        id: format!("toolu_{}", crate::util::short_id(8)),
+        name: canonical,
+        arguments: Value::Object(args),
+    })
 }
 
 /// 掃描 text 找符合「裸 tool_call JSON」的物件（無 `<tool_call>` 包裝）。
@@ -354,15 +426,21 @@ pub fn strip_tool_calls(text: &str) -> String {
 /// 同 `strip_tool_calls`，但帶 registry 以啟用裸 JSON 剝離。傳空 registry 等同舊行為。
 pub fn strip_tool_calls_with(text: &str, registry: &HashMap<String, String>) -> String {
     let blocks = find_tool_blocks(text);
+    let function_blocks = find_function_blocks(text);
     let bytes = text.as_bytes();
 
     let mut ranges: Vec<(usize, usize)> = blocks
         .iter()
         .map(|(open_start, block_end, _, _)| (*open_start, *block_end))
         .collect();
+    ranges.extend(
+        function_blocks
+            .iter()
+            .map(|(open_start, block_end, _, _, _)| (*open_start, *block_end)),
+    );
 
     // 沒抓到區塊但 registry 非空 → 找裸 JSON tool_call 並把整個 JSON 物件納入剝除範圍
-    if blocks.is_empty() && !registry.is_empty() {
+    if blocks.is_empty() && function_blocks.is_empty() && !registry.is_empty() {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'{' {
@@ -405,7 +483,7 @@ pub fn strip_tool_calls_with(text: &str, registry: &HashMap<String, String>) -> 
 
 /// 文字中是否含有疑似 tool_call 標記（用於串流時暫緩輸出判斷）。
 pub fn looks_like_tool_call(text: &str) -> bool {
-    text.contains("<tool_call>") || text.contains("```tool_call")
+    text.contains("<tool_call>") || text.contains("```tool_call") || text.contains("<function=")
 }
 
 #[cfg(test)]
@@ -517,6 +595,42 @@ some text
         let calls = parse_tool_calls(text, &reg);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash", "應該還原為原始客戶端名");
+    }
+
+    #[test]
+    fn function_parameter_block_parses_as_tool_call() {
+        let reg = registry_with(&[("fs_open_file", "Read")]);
+        let text = r#"<function="fs_open_file">
+  <parameter=file_path>
+  /Users/bryceloskie/i/FreeAIchat-2api/app/core/config.py
+"#;
+        let calls = parse_tool_calls(text, &reg);
+        assert_eq!(calls.len(), 1, "function-style block should parse: {calls:?}");
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "/Users/bryceloskie/i/FreeAIchat-2api/app/core/config.py"
+        );
+        assert!(strip_tool_calls(text).trim().is_empty());
+    }
+
+    #[test]
+    fn multiple_function_parameter_blocks_parse_separately() {
+        let reg = registry_with(&[("fs_open_file", "Read"), ("shell_run", "Bash")]);
+        let text = r#"<function="fs_open_file">
+<parameter=file_path>
+/tmp/a.txt
+<function="shell_run">
+<parameter=command>
+pwd
+"#;
+        let calls = parse_tool_calls(text, &reg);
+        assert_eq!(calls.len(), 2, "adjacent function blocks should parse separately: {calls:?}");
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "/tmp/a.txt");
+        assert_eq!(calls[1].name, "Bash");
+        assert_eq!(calls[1].arguments["command"], "pwd");
+        assert!(strip_tool_calls(text).trim().is_empty());
     }
 
     fn registry_with(tools: &[(&str, &str)]) -> HashMap<String, String> {

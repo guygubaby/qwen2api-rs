@@ -1,8 +1,8 @@
-# qwen2api-rs — Project AI Context
+# qwen2api-rs — 專案 AI 上下文
 
-Qwen Web gateway exposed as OpenAI/Anthropic/Gemini compatible APIs. **Rust backend only** (`axum`/`tokio`/`reqwest`); the browser Web UI has been removed.
-Based on the upstream `YuJunZhiXue/qwen2API` rewrite work. Upstream sync notes live in `dev/UPSTREAM.md`, protocol notes in `dev/PROTOCOL.md`, and architecture notes in `dev/ARCHITECTURE.md`.
-The public env surface is intentionally small; see `.env.example` for the supported deployment variables.
+把 Qwen Web 偽裝成 OpenAI/Anthropic/Gemini 相容介面的網關。**後端 Rust（axum/tokio/reqwest）+ 純原生前端三檔（web/）**。
+基於上游 `YuJunZhiXue/qwen2API` 重寫；基準版本與同步流程見 `dev/UPSTREAM.md`、協議見 `dev/PROTOCOL.md`、架構見 `dev/ARCHITECTURE.md`。
+所有可調 env 變數的權威清單在 `.env.example`（含風控/帳號池/上下文等 20+ 項）。
 
 ## 開發 / 執行注意
 - `CARGO_TARGET_DIR=/home/joe/.cache/cargo-target` → 二進位在該處的 `debug/`、`release/`，**不是** `./target`。

@@ -77,7 +77,7 @@ impl From<anyhow::Error> for AppError {
 
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
-        AppError::BadRequest(format!("JSON 解析錯誤: {e}"))
+        AppError::BadRequest(format!("JSON parse error: {e}"))
     }
 }
 

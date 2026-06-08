@@ -24,7 +24,7 @@ pub async fn messages(
 ) -> Response {
     let body: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return AppError::BadRequest(format!("JSON 解析錯誤: {e}")).into_response(),
+        Err(e) => return AppError::BadRequest(format!("JSON parse error: {e}")).into_response(),
     };
     let auth = match resolve_auth(&state, &headers, &query).await {
         Ok(a) => a,
@@ -33,10 +33,23 @@ pub async fn messages(
     let mut std = build_openai_request(&state, &body, &headers, "anthropic", "claude-3-5-sonnet").await;
     let token = auth.token;
     std.caller = Some(token.clone());
+    let tool_name_preview: Vec<String> = std.tool_names.iter().take(20).cloned().collect();
+    tracing::debug!(
+        target: "qwen2api.anthropic",
+        model = %std.response_model,
+        resolved_model = %std.resolved_model,
+        stream = std.stream,
+        tools = std.tools.len(),
+        profile = %std.client_profile,
+        thinking_enabled = ?std.thinking_enabled,
+        has_thinking_field = body.get("thinking").is_some(),
+        tool_names = ?tool_name_preview,
+        "received Anthropic Messages request"
+    );
 
     if std.stream {
         let model = std.response_model.clone();
-        let prompt_tokens = execution::count_tokens(&std.prompt) as i64;
+        let prompt_tokens = execution::estimate_tokens_fast(&std.prompt) as i64;
         let registry = execution::registry_for(&std);
         let body_stream = async_stream::stream! {
             let mut tr = AnthropicStreamTranslator::new(&model, prompt_tokens);

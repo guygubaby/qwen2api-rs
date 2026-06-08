@@ -87,9 +87,9 @@ pub async fn build_gemini_request(
                     if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
                         text.push_str(t);
                     } else if let Some(fc) = p.get("functionCall") {
-                        text.push_str(&format!("[呼叫工具 {}]", fc));
+                        text.push_str(&format!("[tool call {}]", fc));
                     } else if let Some(fr) = p.get("functionResponse") {
-                        text.push_str(&format!("[工具結果 {}]", fr));
+                        text.push_str(&format!("[tool result {}]", fr));
                     }
                 }
             }
@@ -177,10 +177,17 @@ pub async fn build_openai_request(
         built.prompt
     };
 
-    let (thinking_enabled, _forced) = extract_thinking(body, mode.force_thinking);
+    let (mut thinking_enabled, _forced) = extract_thinking(body, mode.force_thinking);
     let enable_search =
         mode.chat_type == "deep_research" || coerce_bool(body.get("enable_search")).unwrap_or(false);
     let stream = coerce_bool(body.get("stream")).unwrap_or(false);
+    if surface == "anthropic"
+        && stream
+        && mode.chat_type == "t2t"
+        && profile == client_profiles::CLAUDE_CODE
+    {
+        thinking_enabled = Some(true);
+    }
     let max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))

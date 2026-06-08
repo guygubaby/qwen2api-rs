@@ -36,14 +36,14 @@ pub fn extract_text_content(content: &Value) -> String {
                             .and_then(|v| v.as_str())
                         {
                             if url.starts_with("http") {
-                                out.push_str(&format!("\n[圖片: {url}]\n"));
+                                out.push_str(&format!("\n[Image: {url}]\n"));
                             } else {
-                                out.push_str("\n[圖片附件]\n");
+                                out.push_str("\n[Image attachment]\n");
                             }
                         }
                     }
                     "input_image" | "image" => {
-                        out.push_str("\n[圖片附件]\n");
+                        out.push_str("\n[Image attachment]\n");
                     }
                     "input_file" | "file" => {
                         let name = part
@@ -51,7 +51,7 @@ pub fn extract_text_content(content: &Value) -> String {
                             .or_else(|| part.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("file");
-                        out.push_str(&format!("\n[檔案附件: {name}]\n"));
+                        out.push_str(&format!("\n[File attachment: {name}]\n"));
                     }
                     "tool_result" => {
                         // Anthropic tool_result：content 可能是字串或 parts
@@ -119,7 +119,7 @@ fn render_message(m: &Value) -> Option<String> {
             for tc in tcs {
                 let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
                 let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}");
-                s.push_str(&format!("[呼叫工具 {name}({args})]"));
+                s.push_str(&format!("[tool call {name}({args})]"));
             }
             return Some(format!("{}: {}", role_label(role), s));
         }
@@ -129,7 +129,7 @@ fn render_message(m: &Value) -> Option<String> {
     if role == "tool" {
         let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
         let text = extract_text_content(content);
-        return Some(format!("Tool [{name}] 結果: {text}"));
+        return Some(format!("Tool [{name}] result: {text}"));
     }
 
     let text = extract_text_content(content);

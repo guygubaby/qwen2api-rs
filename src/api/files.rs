@@ -40,20 +40,20 @@ pub async fn upload(
             }
             match field.bytes().await {
                 Ok(b) => bytes = b.to_vec(),
-                Err(e) => return AppError::BadRequest(format!("讀取檔案失敗: {e}")).into_response(),
+                Err(e) => return AppError::BadRequest(format!("Failed to read file: {e}")).into_response(),
             }
         }
     }
 
     if bytes.is_empty() {
-        return AppError::BadRequest("未提供檔案內容".into()).into_response();
+        return AppError::BadRequest("No file content provided".into()).into_response();
     }
 
     // 副檔名白名單檢查
     let allowed = &state.settings.context_allowed_user_exts;
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     if !ext.is_empty() && !allowed.split(',').any(|e| e.trim() == ext) {
-        return AppError::BadRequest(format!("不支援的副檔名: .{ext}")).into_response();
+        return AppError::BadRequest(format!("Unsupported file extension: .{ext}")).into_response();
     }
 
     let meta = state.file_store.save_bytes(&filename, &content_type, &bytes, &purpose).await;

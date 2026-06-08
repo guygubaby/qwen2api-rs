@@ -5,6 +5,8 @@ use super::{OutEvent, Usage};
 use crate::util::{now_unix, short_id};
 use serde_json::{json, Value};
 
+const UNSIGNED_THINKING_SIGNATURE: &str = "cXdlbjJhcGktcnMtdW5zaWduZWQtdGhpbmtpbmc=";
+
 /// SSE event 行（Anthropic 用 event: + data:）。
 fn sse_event(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
@@ -62,6 +64,13 @@ impl AnthropicStreamTranslator {
 
     fn close_block(&mut self, out: &mut Vec<String>) {
         if self.current != Block::None {
+            if self.current == Block::Thinking {
+                out.push(sse_event(
+                    "content_block_delta",
+                    &json!({"type":"content_block_delta","index": self.index,
+                            "delta": {"type":"signature_delta","signature": UNSIGNED_THINKING_SIGNATURE}}),
+                ));
+            }
             out.push(sse_event("content_block_stop", &json!({"type":"content_block_stop","index": self.index})));
             self.index += 1;
             self.current = Block::None;
@@ -70,7 +79,7 @@ impl AnthropicStreamTranslator {
 
     fn open_block(&mut self, out: &mut Vec<String>, kind: Block) {
         let (btype, cb) = match kind {
-            Block::Thinking => ("thinking", json!({"type":"thinking","thinking":""})),
+            Block::Thinking => ("thinking", json!({"type":"thinking","thinking":"","signature":UNSIGNED_THINKING_SIGNATURE})),
             Block::Text => ("text", json!({"type":"text","text":""})),
             Block::None => return,
         };

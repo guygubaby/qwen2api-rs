@@ -12,6 +12,7 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 執行器輸出的事件。
 #[derive(Debug, Clone)]
@@ -105,11 +106,12 @@ impl Drop for StreamGuard {
         let (attempts, delay) = (self.delete_attempts, self.delete_delay_ms);
         // Drop 不能 await → spawn detached 清理任務
         tokio::spawn(async move {
-            if let Some(cid) = chat_id {
-                client.delete_chat_reliable(&token, &cid, attempts, delay).await;
-            }
             if let Some(em) = email {
                 pool.release(&em).await;
+            }
+            if let Some(cid) = chat_id {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                client.delete_chat_reliable(&token, &cid, attempts, delay).await;
             }
         });
     }
@@ -144,7 +146,7 @@ impl Executor {
         if use_prewarmed && chat_type == "t2t" {
             // 傳入 token：回補與過期刪除都用它，避免在熱路徑查 pool（O(n) 鎖競爭）。
             if let Some(cid) = self.chat_id_pool.acquire(email, token, model).await {
-                tracing::debug!("[執行器] 預熱池命中 email={email} chat={cid}");
+                tracing::debug!("[executor] prewarmed chat_id hit email={email} chat={cid}");
                 return Ok((cid, true));
             }
         }
@@ -169,7 +171,7 @@ impl Executor {
                 let handle = if let Some(email) = &params.fixed_account {
                     match self.pool.token_of(email).await {
                         Some(token) => crate::account::AccountHandle { email: email.clone(), token },
-                        None => { yield UpstreamEvent::Error(format!("指定帳號不存在: {email}")); return; }
+                        None => { yield UpstreamEvent::Error(format!("fixed account not found: {email}")); return; }
                     }
                 } else {
                     match self.pool.acquire_wait(None, &exclude, 60.0).await {
@@ -177,7 +179,7 @@ impl Executor {
                         None => {
                             // 若先前嘗試已有真實錯誤，浮現它而非掩蓋成「無可用帳號」
                             let msg = last_error.clone().unwrap_or_else(|| {
-                                "帳號池無可用帳號（全忙或限流）".into()
+                                "no available Qwen accounts; all accounts are busy or rate limited".into()
                             });
                             yield UpstreamEvent::Error(msg);
                             return;
@@ -212,7 +214,7 @@ impl Executor {
                         last_error = Some(msg.clone());
                         self.classify_and_mark(&email, &msg).await;
                         exclude.insert(email.clone());
-                        tracing::warn!("[執行器] 建會話失敗 第{}次 email={email} err={msg}", attempt + 1);
+                        tracing::warn!("[executor] create_chat failed attempt={} email={email} err={msg}", attempt + 1);
                         continue;
                     }
                 };
@@ -244,7 +246,7 @@ impl Executor {
                         last_error = Some(msg.clone());
                         self.classify_and_mark(&email, &msg).await;
                         exclude.insert(email.clone());
-                        tracing::warn!("[執行器] 串流啟動失敗 第{}次 email={email} err={msg}", attempt + 1);
+                        tracing::warn!("[executor] stream start failed attempt={} email={email} err={msg}", attempt + 1);
                         continue;
                     }
                 };
@@ -287,7 +289,7 @@ impl Executor {
                             }
                         }
                         Some(Err(e)) => {
-                            stream_error = Some(format!("串流讀取錯誤: {e}"));
+                            stream_error = Some(format!("stream read error: {e}"));
                             break 'consume;
                         }
                         None => break 'consume,
@@ -318,15 +320,19 @@ impl Executor {
                         // （Anthropic translator 是用 content_block index 各自獨立，重來會開新 thinking/text block；
                         // OpenAI translator 是純增量，重來會接續再吐；雖非完美，比直接斷掉好得多）。
                         if params.chat_type == "t2t" && !had_answer_content {
-                            let err = "上游回應無 answer content（可能只有 reasoning 或全空），視為瞬時錯誤重試".to_string();
+                            let err = "upstream returned no answer content; retrying as a transient error".to_string();
                             last_error = Some(err.clone());
                             // 不 classify_and_mark：避免把這帳號標 invalid（401/429 pattern 都不 match）
                             exclude.insert(email.clone());
-                            tracing::warn!("[執行器] 無 answer 內容視為失敗 第{}次 email={email}", attempt + 1);
+                            tracing::warn!("[executor] no answer content; treating as failed attempt={} email={email}", attempt + 1);
                             continue;
                         }
                         if is_pool_acquired {
-                            self.pool.mark_success(&email).await;
+                            let pool = self.pool.clone();
+                            let email_for_mark = email.clone();
+                            tokio::spawn(async move {
+                                pool.mark_success(&email_for_mark).await;
+                            });
                         }
                         yield UpstreamEvent::Done;
                         return; // guard drop → 刪會話 + 釋放帳號
@@ -352,17 +358,17 @@ impl Executor {
                         last_error = Some(err.clone());
                         self.classify_and_mark(&email, &err).await;
                         exclude.insert(email.clone());
-                        let stage = if had_answer_content { "已部分輸出但屬於換帳號可解類" } else { "無 answer 內容前" };
-                        tracing::warn!("[執行器] 串流錯誤（{stage}）可重試 第{}次 email={email} err={err}", attempt + 1);
+                        let stage = if had_answer_content { "after partial answer but account-swap retryable" } else { "before answer content" };
+                        tracing::warn!("[executor] retryable stream error ({stage}) attempt={} email={email} err={err}", attempt + 1);
                         continue; // guard drop → 清理本次帳號/會話，下輪重新取得
                     }
                 }
             }
 
             yield UpstreamEvent::Error(format!(
-                "全部 {} 次嘗試失敗。最後錯誤: {}",
+                "all {} attempts failed; last error: {}",
                 attempts,
-                last_error.unwrap_or_else(|| "未知".into())
+                last_error.unwrap_or_else(|| "unknown".into())
             ));
         }
     }
@@ -429,10 +435,8 @@ fn is_account_swap_retryable(err: &str) -> bool {
     {
         return true;
     }
-    // 內容安全 false-positive：阿里云對 thinking model 輸出 / fetch 結果偶發過敏，
-    // 不同上游帳號審查結果不一定相同 → 給 1-2 次跨帳號重試機會。
-    // 即便真敏感，受 max_retries=3 上限保護，最差只多等 ~20s 才吐 error。
-    if lower.contains("data_inspection_failed") || lower.contains("内容安全") {
+    // Safety false positives can vary by account/route, so give account swap a chance.
+    if lower.contains("data_inspection_failed") || lower.contains("\u{5185}\u{5bb9}\u{5b89}\u{5168}") {
         return true;
     }
     false
@@ -452,22 +456,22 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::is_account_swap_retryable;
 
-    /// 阿里云 model studio 的真實 quota 錯誤訊息（命中 `allocated quota`／`quota exceeded`／`token-limit`）
+    /// Real Alibaba Model Studio quota error.
     #[test]
     fn aliyun_quota_exceeded_is_swap_retryable() {
         let real = "Qwen upstream error code=internal_error request_id=a79b... details=Allocated quota exceeded, please increase your quota limit. For details, see: https://help.aliyun.com/zh/model-studio/error-code#token-limit";
-        assert!(is_account_swap_retryable(real), "Allocated quota exceeded 應走跨帳號重試");
+        assert!(is_account_swap_retryable(real), "Allocated quota exceeded should be account-swap retryable");
     }
 
-    /// 429 / rate limit 系列
+    /// 429 / rate limit variants.
     #[test]
     fn rate_limit_variants_are_swap_retryable() {
         for s in ["HTTP 429 Too Many Requests", "rate limit exceeded", "RateLimited", "too many requests"] {
-            assert!(is_account_swap_retryable(s), "應為 swap-retryable: {s}");
+            assert!(is_account_swap_retryable(s), "should be swap-retryable: {s}");
         }
     }
 
-    /// 上游維護性暫時錯誤
+    /// Transient upstream errors.
     #[test]
     fn transient_upstream_errors_are_swap_retryable() {
         for s in [
@@ -477,30 +481,29 @@ mod tests {
             "502 Bad Gateway",
             "504 Gateway Timeout",
         ] {
-            assert!(is_account_swap_retryable(s), "應為 swap-retryable: {s}");
+            assert!(is_account_swap_retryable(s), "should be swap-retryable: {s}");
         }
     }
 
-    /// 認證 / 客戶端格式問題 → 換帳號沒用，不該重試
+    /// Auth/client-side format errors should not be retried with another account.
     #[test]
     fn permanent_errors_are_not_swap_retryable() {
         for s in [
             "401 Unauthorized invalid token",
             "code=auth_error account banned",
-            "JSON 解析錯誤",
+            "JSON parse error",
             "expected string at line 1 column 2",
         ] {
-            assert!(!is_account_swap_retryable(s), "不該 swap-retry: {s}");
+            assert!(!is_account_swap_retryable(s), "should not be swap-retryable: {s}");
         }
     }
 
-    /// 內容安全 false-positive：給跨帳號重試一次機會（阿里云不同 instance 結果可能不同）。
-    /// 真敏感時受 max_retries 上限保護，不會無限耗 quota。
+    /// Safety false positives should get an account-swap retry.
     #[test]
     fn data_inspection_false_positive_is_swap_retryable() {
-        let real_input = "Qwen upstream error code=data_inspection_failed request_id=f9b6df2a-788a-460b-bb15-99a0dcb0f5c1 details=内容安全警告：输入数据可能包含不适当的内容！";
-        let real_output = "Qwen upstream error code=data_inspection_failed details=内容安全警告：输出内容可能包含不适当的内容！";
-        assert!(is_account_swap_retryable(real_input), "input 端內容安全 false-positive 應給跨帳號重試機會");
-        assert!(is_account_swap_retryable(real_output), "output 端 false-positive 同理");
+        let real_input = "Qwen upstream error code=data_inspection_failed request_id=f9b6df2a-788a-460b-bb15-99a0dcb0f5c1 details=\u{5185}\u{5bb9}\u{5b89}\u{5168} warning";
+        let real_output = "Qwen upstream error code=data_inspection_failed details=\u{5185}\u{5bb9}\u{5b89}\u{5168} warning";
+        assert!(is_account_swap_retryable(real_input), "input safety false-positive should be retried with another account");
+        assert!(is_account_swap_retryable(real_output), "output safety false-positive should be retried with another account");
     }
 }

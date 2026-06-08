@@ -46,10 +46,6 @@ pub fn build_chat_payload(args: &BuildPayloadArgs) -> Value {
     fc.insert("thinking_mode".into(), json!("Auto"));
     fc.insert("thinking_format".into(), json!("summary"));
     fc.insert("code_interpreter".into(), json!(false));
-    // 低延遲覆蓋（有自定義工具時關閉思考）
-    if args.has_custom_tools {
-        apply_thinking(&mut fc, false);
-    }
     // 關鍵：強制關閉原生工具，避免上游攔截本地文字工具指令
     fc.insert("function_calling".into(), json!(false));
     fc.insert("enable_tools".into(), json!(false));

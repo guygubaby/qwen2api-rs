@@ -34,13 +34,13 @@ fn build_http(proxy: Option<&str>) -> reqwest::Client {
             match reqwest::Proxy::all(p) {
                 Ok(px) => {
                     b = b.proxy(px);
-                    tracing::info!("[QwenClient] 出口代理已啟用");
+                    tracing::info!("[QwenClient] upstream proxy enabled");
                 }
-                Err(e) => tracing::warn!("[QwenClient] 無效出口代理 {p}: {e}（忽略）"),
+                Err(e) => tracing::warn!("[QwenClient] invalid upstream proxy {p}: {e} (ignored)"),
             }
         }
     }
-    b.build().expect("建立 reqwest client 失敗")
+    b.build().expect("failed to build reqwest client")
 }
 
 pub struct QwenClient {
@@ -100,7 +100,7 @@ impl QwenClient {
     /// 細節見 memory `reference-qwen-signin-protocol`。
     pub async fn signin(&self, email: &str, plain_password: &str) -> AppResult<String> {
         if plain_password.is_empty() {
-            return Err(AppError::Unauthorized("帳號無 password 欄位，無法重登".into()));
+            return Err(AppError::Unauthorized("Account has no password field; cannot sign in".into()));
         }
         let url = format!("{BASE_URL}/api/v1/auths/signin");
         let body = serde_json::json!({
@@ -121,15 +121,15 @@ impl QwenClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Upstream(format!("signin 連線失敗: {e}")))?;
+            .map_err(|e| AppError::Upstream(format!("signin connection failed: {e}")))?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         if status == 200 {
             let v: Value = serde_json::from_str(&text)
-                .map_err(|e| AppError::Upstream(format!("signin 回應解析失敗: {e}")))?;
+                .map_err(|e| AppError::Upstream(format!("signin response parse failed: {e}")))?;
             let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
             if token.is_empty() {
-                return Err(AppError::Upstream("signin 200 但 token 欄位空".into()));
+                return Err(AppError::Upstream("signin returned 200 but token is empty".into()));
             }
             return Ok(token.to_string());
         }
@@ -209,7 +209,7 @@ impl QwenClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Upstream(format!("create_chat 連線失敗: {e}")))?;
+            .map_err(|e| AppError::Upstream(format!("create_chat connection failed: {e}")))?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         if status != 200 {
@@ -252,7 +252,7 @@ impl QwenClient {
             .and_then(|d| d.get("id"))
             .and_then(|i| i.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| AppError::Upstream("create_chat 缺少 data.id".into()))
+            .ok_or_else(|| AppError::Upstream("create_chat response is missing data.id".into()))
     }
 
     /// 刪除會話 DELETE /api/v2/chats/{chat_id}（200/204/404 視為成功）。
@@ -283,7 +283,7 @@ impl QwenClient {
                 tokio::time::sleep(Duration::from_millis(delay_ms * attempt as u64)).await;
             }
         }
-        tracing::warn!("[DeleteChat] 多次刪除失敗 chat_id={chat_id}");
+        tracing::warn!("[DeleteChat] delete failed after retries chat_id={chat_id}");
     }
 
     /// 發起串流補全，回傳 reqwest Response（呼叫端做 SSE framing）。
@@ -296,7 +296,7 @@ impl QwenClient {
             .json(payload)
             .send()
             .await
-            .map_err(|e| AppError::Upstream(format!("stream 連線失敗: {e}")))?;
+            .map_err(|e| AppError::Upstream(format!("stream connection failed: {e}")))?;
         let status = resp.status().as_u16();
         if status != 200 {
             let body = resp.text().await.unwrap_or_default();

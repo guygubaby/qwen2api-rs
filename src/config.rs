@@ -1,7 +1,9 @@
-//! 全域設定，對應 Python `core/config.py`。
-//! 從環境變數 / `.env` 讀取，並提供 MODEL_MAP 模型別名映射。
+//! Global settings loaded from environment variables and `.env`.
+//!
+//! Public configuration is intentionally small. Most operational tuning values use
+//! code defaults so deployments only need to pass the credentials and paths that
+//! differ from the defaults.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -14,11 +16,16 @@ fn env_str(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// 執行期設定。部分欄位（並發/預熱池）可在管理台運行時調整，故用內部可變的 AppState 持有副本。
+fn env_optional(key: &str) -> Option<String> {
+    env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Runtime settings. Internal tuning is intentionally defaulted in code; the
+/// environment surface stays close to the reference API-only project.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub port: u16,
-    pub admin_key: String,
+    pub api_key: String,
 
     // 並發 / 容災
     pub max_inflight_per_account: i64,
@@ -45,8 +52,8 @@ pub struct Settings {
     // 資料檔案路徑
     pub data_dir: PathBuf,
     pub accounts_file: PathBuf,
-    pub users_file: PathBuf,
-    pub api_keys_file: PathBuf,
+    /// Optional JSON array of accounts supplied directly through env.
+    pub accounts_json: Option<String>,
     pub config_file: PathBuf,
     /// 請求統計 SQLite 檔（data/stats.db）。
     pub stats_file: PathBuf,
@@ -110,77 +117,58 @@ fn read_proxy_env() -> Option<String> {
 impl Settings {
     pub fn from_env() -> Self {
         let data_dir = PathBuf::from(env_str("DATA_DIR", "./data"));
-        let p = |key: &str, default_name: &str| -> PathBuf {
-            match env::var(key) {
-                Ok(v) => PathBuf::from(v),
-                Err(_) => data_dir.join(default_name),
-            }
-        };
+        let data_path = |default_name: &str| -> PathBuf { data_dir.join(default_name) };
         Settings {
             port: env_or("PORT", 7860u16),
-            admin_key: env_str("ADMIN_KEY", "admin"),
-            max_inflight_per_account: env::var("MAX_INFLIGHT_PER_ACCOUNT")
-                .or_else(|_| env::var("MAX_INFLIGHT"))
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
-            max_retries: env_or("MAX_RETRIES", 3u32),
-            auth_error_fail_threshold: env_or("AUTH_ERROR_FAIL_THRESHOLD", 3u32),
-            // 風控：同帳號兩次請求之間的強制休息（毫秒）。預設 3s，避免單帳號被打太快而封號。
-            account_min_interval_ms: env_or("ACCOUNT_MIN_INTERVAL_MS", 3000u64),
-            request_jitter_min_ms: env_or("REQUEST_JITTER_MIN_MS", 0u64),
-            request_jitter_max_ms: env_or("REQUEST_JITTER_MAX_MS", 0u64),
-            rate_limit_base_cooldown: env_or("RATE_LIMIT_BASE_COOLDOWN", 600u64),
-            rate_limit_max_cooldown: env_or("RATE_LIMIT_MAX_COOLDOWN", 3600u64),
-            chat_delete_retry_attempts: env_or("CHAT_DELETE_RETRY_ATTEMPTS", 3u32),
-            chat_delete_retry_delay_ms: (env_or::<f64>("CHAT_DELETE_RETRY_DELAY_SECONDS", 0.5) * 1000.0) as u64,
-            chat_id_prewarm_target_per_account: env_or("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5usize),
-            chat_id_prewarm_ttl_seconds: env_or("CHAT_ID_PREWARM_TTL_SECONDS", 120u64),
-            chat_id_prewarm_max_accounts: env_or("CHAT_ID_PREWARM_MAX_ACCOUNTS", 8usize),
+            api_key: env_str("API_KEY", "change-me-now"),
+            max_inflight_per_account: 2,
+            max_retries: 3,
+            auth_error_fail_threshold: 3,
+            account_min_interval_ms: 3000,
+            request_jitter_min_ms: 0,
+            request_jitter_max_ms: 0,
+            rate_limit_base_cooldown: 600,
+            rate_limit_max_cooldown: 3600,
+            chat_delete_retry_attempts: 3,
+            chat_delete_retry_delay_ms: 500,
+            chat_id_prewarm_target_per_account: 5,
+            chat_id_prewarm_ttl_seconds: 120,
+            chat_id_prewarm_max_accounts: 8,
             log_level: env_str("LOG_LEVEL", "info"),
-            accounts_file: p("ACCOUNTS_FILE", "accounts.json"),
-            users_file: p("USERS_FILE", "users.json"),
-            api_keys_file: p("API_KEYS_FILE", "api_keys.json"),
-            config_file: p("CONFIG_FILE", "config.json"),
-            stats_file: p("STATS_FILE", "stats.db"),
-            media_db_file: p("MEDIA_DB_FILE", "media.db"),
-            media_dir: p("MEDIA_DIR", "generated_media"),
-            media_concurrency: env_or("MEDIA_CONCURRENCY", 3usize),
-            media_max_attempts: env_or("MEDIA_MAX_ATTEMPTS", 10u32),
-            no_t2v_file: p("NO_T2V_FILE", "no_t2v_accounts.json"),
-            context_inline_max_chars: env_or("CONTEXT_INLINE_MAX_CHARS", 4000usize),
-            context_force_file_max_chars: env_or("CONTEXT_FORCE_FILE_MAX_CHARS", 10000usize),
-            context_attachment_ttl_seconds: env_or("CONTEXT_ATTACHMENT_TTL_SECONDS", 1800u64),
-            context_upload_parse_timeout_seconds: env_or("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60u64),
-            context_generated_dir: p("CONTEXT_GENERATED_DIR", "context_files"),
-            context_cache_file: p("CONTEXT_CACHE_FILE", "context_cache.json"),
-            uploaded_files_file: p("UPLOADED_FILES_FILE", "uploaded_files.json"),
-            context_affinity_file: p("CONTEXT_AFFINITY_FILE", "session_affinity.json"),
-            context_allowed_user_exts: env_str(
-                "CONTEXT_ALLOWED_USER_EXTS",
-                "txt,md,json,log,xml,yaml,yml,csv,html,css,py,js,ts,java,c,cpp,cs,php,go,rb,sh,zsh,ps1,bat,cmd,pdf,doc,docx,ppt,pptx,xls,xlsx,png,jpg,jpeg,webp,gif,tiff,bmp,svg",
-            ),
+            accounts_file: env_optional("ACCOUNTS_FILE").map(PathBuf::from).unwrap_or_else(|| data_path("accounts.json")),
+            accounts_json: env_optional("QWEN_ACCOUNTS_JSON"),
+            config_file: data_path("config.json"),
+            stats_file: data_path("stats.db"),
+            media_db_file: data_path("media.db"),
+            media_dir: data_path("generated_media"),
+            media_concurrency: 3,
+            media_max_attempts: 10,
+            no_t2v_file: data_path("no_t2v_accounts.json"),
+            context_inline_max_chars: 4000,
+            context_force_file_max_chars: 10000,
+            context_attachment_ttl_seconds: 1800,
+            context_upload_parse_timeout_seconds: 60,
+            context_generated_dir: data_path("context_files"),
+            context_cache_file: data_path("context_cache.json"),
+            uploaded_files_file: data_path("uploaded_files.json"),
+            context_affinity_file: data_path("session_affinity.json"),
+            context_allowed_user_exts:
+                "txt,md,json,log,xml,yaml,yml,csv,html,css,py,js,ts,java,c,cpp,cs,php,go,rb,sh,zsh,ps1,bat,cmd,pdf,doc,docx,ppt,pptx,xls,xlsx,png,jpg,jpeg,webp,gif,tiff,bmp,svg".to_string(),
             data_dir,
             default_model: env_str("DEFAULT_MODEL", "qwen3.7-plus"),
             upstream_proxy: read_proxy_env(),
-            // 預設開；設 POOL_READY_INDEX=0/false/off/no 可回退舊掃描。
-            pool_ready_index: env::var("POOL_READY_INDEX")
-                .ok()
-                .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "off" | "no"))
-                .unwrap_or(true),
-            conn_keepalive_seconds: env_or("CONN_KEEPALIVE_SECONDS", 0u64),
-            // Token refresh worker（預設開啟，每 6h 跑、提前 7 天刷、每輪上限 500、每帳號 2-5 秒 jitter）
-            token_refresh_interval_hours: env_or("TOKEN_REFRESH_INTERVAL_HOURS", 6u64),
-            token_refresh_ahead_days: env_or("TOKEN_REFRESH_AHEAD_DAYS", 7i64),
-            token_refresh_batch_per_cycle: env_or("TOKEN_REFRESH_BATCH_PER_CYCLE", 500usize),
-            token_refresh_jitter_min_ms: env_or("TOKEN_REFRESH_JITTER_MIN_MS", 2000u64),
-            token_refresh_jitter_max_ms: env_or("TOKEN_REFRESH_JITTER_MAX_MS", 5000u64),
+            pool_ready_index: true,
+            conn_keepalive_seconds: 0,
+            token_refresh_interval_hours: 6,
+            token_refresh_ahead_days: 7,
+            token_refresh_batch_per_cycle: 500,
+            token_refresh_jitter_min_ms: 2000,
+            token_refresh_jitter_max_ms: 5000,
         }
     }
 }
 
-/// 預設模型別名映射（對應 Python MODEL_MAP）。下游傳入的模型名 → Qwen 實際 base model。
-/// 注意：上游現役旗艦已是 qwen3.7-plus（見 dev/UPSTREAM.md），故預設指向之。
+/// Default model aliases. Client-facing model name -> Qwen base model.
 pub fn default_model_map() -> HashMap<String, String> {
     let plus = "qwen3.7-plus";
     let flash = "qwen3.5-flash";
@@ -197,21 +185,14 @@ pub fn default_model_map() -> HashMap<String, String> {
         ("gemini-2.5-pro", plus), ("gemini-2.5-flash", flash),
         // Qwen aliases
         ("qwen", plus), ("qwen-max", plus), ("qwen-plus", plus), ("qwen-turbo", flash),
-        ("qwen3.6-plus", plus), // 舊預設 → 導向現役
+        ("qwen3.6-plus", plus),
         // DeepSeek
         ("deepseek-chat", plus), ("deepseek-reasoner", plus),
     ];
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
-/// 從 model_aliases 解析實際 base model；命中則回映射值，否則原樣返回。
+/// Resolve an alias to the actual upstream base model.
 pub fn resolve_model(map: &HashMap<String, String>, name: &str) -> String {
     map.get(name).cloned().unwrap_or_else(|| name.to_string())
-}
-
-/// api_keys.json 的結構 `{"keys": [...]}`
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct ApiKeysFile {
-    #[serde(default)]
-    pub keys: Vec<String>,
 }

@@ -146,7 +146,7 @@ pub async fn prepare_attachments(state: &AppState, body: &Value) -> AttachmentRe
                 if text.chars().count() <= inline_max {
                     result
                         .inline_note
-                        .push_str(&format!("\n\n[附件檔案: {}]\n```\n{}\n```", a.filename, text));
+                        .push_str(&format!("\n\n[Attached file: {}]\n```\n{}\n```", a.filename, text));
                     continue;
                 }
             }
@@ -168,8 +168,8 @@ pub async fn prepare_attachments(state: &AppState, body: &Value) -> AttachmentRe
                     result.bound_account = Some(email.clone());
                 }
                 Err(e) => {
-                    tracing::warn!("附件上傳失敗 {}: {e}", a.filename);
-                    result.inline_note.push_str(&format!("\n\n[附件 {} 上傳失敗，已略過]", a.filename));
+                    tracing::warn!("attachment upload failed {}: {e}", a.filename);
+                    result.inline_note.push_str(&format!("\n\n[Attachment {} upload failed and was skipped]", a.filename));
                 }
             }
         }

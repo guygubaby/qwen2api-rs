@@ -131,16 +131,15 @@ pub async fn generate_with_retry(
     let mut newly_marked: HashSet<String> = HashSet::new();
 
     for attempt in 1..=attempts {
-        // 提早結束：若 exclude 集合已涵蓋（或超過）池中 valid 帳號數，再嘗試只會等 60s 排隊逾時。
         if kind == MediaKind::Video {
             let pool_status = state.pool.status().await;
             let valid = pool_status.get("valid").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             if valid > 0 && exclude.len() >= valid {
                 tracing::warn!(
-                    "[media] video 第{}次：跳過集已涵蓋全部 {} 個 valid 帳號，提早結束",
+                    "[media] video attempt {}: skip set covers all {} valid accounts; stopping early",
                     attempt, valid
                 );
-                last_error = Some("無剩餘有 t2v 權限的帳號可嘗試".to_string());
+                last_error = Some("no remaining accounts with t2v access to try".to_string());
                 break;
             }
         }
@@ -166,17 +165,16 @@ pub async fn generate_with_retry(
         };
         let r = crate::execution::collect_completion(state.clone(), std, HashMap::new()).await;
 
-        // 「帳號池無可用帳號」屬於 exclude 把池打光了→ 提早結束。
         if let Some(e) = &r.error {
             last_error = Some(e.clone());
-            if e.contains("無可用帳號") || e.contains("無可用") {
+            if e.contains("no available Qwen accounts") || e.contains("no remaining accounts") {
                 tracing::warn!(
-                    "[media] {} 第{}次：無可用帳號（exclude={}），提早結束",
+                    "[media] {} attempt {}: no available accounts (exclude={}); stopping early",
                     kind.as_str(), attempt, exclude.len()
                 );
                 break;
             }
-            tracing::warn!("[media] {} 第{}/{}次失敗: {}", kind.as_str(), attempt, attempts, e);
+            tracing::warn!("[media] {} attempt {}/{} failed: {}", kind.as_str(), attempt, attempts, e);
             continue;
         }
         let urls = scrape_urls(&r.content, kind);
@@ -192,17 +190,17 @@ pub async fn generate_with_retry(
         if kind == MediaKind::Video {
             if let Some(em) = r.email {
                 if !exclude.contains(&em) {
-                    tracing::info!("[media] 標記無 t2v 權限帳號 email={em}（本次新增）");
+                    tracing::info!("[media] marking account without t2v access email={em}");
                     exclude.insert(em.clone());
                     newly_marked.insert(em);
                 }
             }
         }
         last_error = Some(format!(
-            "上游未返回{} URL",
-            if kind == MediaKind::Video { "影片" } else { "圖片" }
+            "upstream did not return a {} URL",
+            if kind == MediaKind::Video { "video" } else { "image" }
         ));
-        tracing::warn!("[media] {} 第{}/{}次無 URL（已跳過 {} 個無權限帳號），重試",
+        tracing::warn!("[media] {} attempt {}/{} returned no URL (skipped {} accounts without access); retrying",
             kind.as_str(), attempt, attempts, exclude.len());
     }
     // 失敗也要把已標記的持久化（不讓下次又踩同一批帳號）
@@ -213,11 +211,11 @@ pub async fn generate_with_retry(
     // 失敗錯誤訊息要清楚
     let final_err = if kind == MediaKind::Video {
         Some(format!(
-            "影片生成失敗：嘗試 {} 次後仍未取得 URL（本次跳過 {} 個無 t2v 權限帳號；歷史累計跳過 {} 個）。原因：上游回應空白，多數 Qwen 帳號未開通 t2v 功能。最後錯誤：{}",
+            "video generation failed: no URL after {} attempts (newly skipped {} accounts without t2v access; previously skipped {}). Upstream returned an empty result, which usually means the account does not have t2v access. Last error: {}",
             attempts,
             newly_marked.len(),
             initial_skipped,
-            last_error.unwrap_or_else(|| "無".into())
+            last_error.unwrap_or_else(|| "none".into())
         ))
     } else {
         last_error
@@ -234,7 +232,7 @@ pub async fn download_to_local(
 ) -> Option<String> {
     let resp = client.get(url).timeout(Duration::from_secs(180)).send().await.ok()?;
     if !resp.status().is_success() {
-        tracing::warn!("[media] 下載失敗 HTTP {} url={}", resp.status(), &url[..url.len().min(80)]);
+        tracing::warn!("[media] download failed HTTP {} url={}", resp.status(), &url[..url.len().min(80)]);
         return None;
     }
     let bytes = resp.bytes().await.ok()?;
@@ -250,7 +248,7 @@ pub async fn download_to_local(
     if tokio::fs::write(&path, &bytes).await.is_err() {
         return None;
     }
-    tracing::info!("[media] 已存本地 {} ({} bytes)", filename, bytes.len());
+    tracing::info!("[media] saved local copy {} ({} bytes)", filename, bytes.len());
     Some(filename)
 }
 
@@ -299,7 +297,7 @@ impl MediaStore {
         }
         let _ = std::fs::create_dir_all(&media_dir);
         if let Err(e) = init_schema(&db_path) {
-            tracing::error!("[media] 初始化資料庫失敗: {e}");
+            tracing::error!("[media] database initialization failed: {e}");
         }
         Arc::new(MediaStore { db_path, media_dir })
     }
@@ -347,7 +345,7 @@ impl MediaStore {
             let conn = open_conn(&path)?;
             let n = conn.execute("UPDATE media_tasks SET status='queued' WHERE status='running'", [])?;
             if n > 0 {
-                tracing::info!("[media] 重新排隊 {n} 個中斷的任務");
+                tracing::info!("[media] requeued {n} interrupted tasks");
             }
             Ok(n)
         })
@@ -519,11 +517,11 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Some(v),
         Ok(Err(e)) => {
-            tracing::error!("[media] DB 操作失敗: {e}");
+            tracing::error!("[media] DB operation failed: {e}");
             None
         }
         Err(e) => {
-            tracing::error!("[media] DB 任務 panic: {e}");
+            tracing::error!("[media] DB task panicked: {e}");
             None
         }
     }
@@ -630,7 +628,7 @@ async fn process_task(state: AppState, store: Arc<MediaStore>, id: i64, attempts
     }
 
     if results.is_empty() {
-        store.fail(id, &last_err.unwrap_or_else(|| "生成失败".into()), total_attempts).await;
+        store.fail(id, &last_err.unwrap_or_else(|| "generation failed".into()), total_attempts).await;
     } else {
         store.complete(id, json!(results), total_attempts).await;
     }

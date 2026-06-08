@@ -26,6 +26,14 @@ pub fn count_tokens(text: &str) -> usize {
     BPE.encode_ordinary(text).len()
 }
 
+pub fn estimate_tokens_fast(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        (text.len() / 4).max(1)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub prompt_tokens: i64,
@@ -103,6 +111,52 @@ fn parse_upstream_usage(v: &Value) -> (i64, i64) {
         .and_then(|x| x.as_i64())
         .unwrap_or(0);
     (output, reasoning)
+}
+
+const TOOL_MARKERS: [&str; 4] = ["<tool_call", "```tool_call", "```json", "<function="];
+
+fn first_tool_marker(text: &str) -> Option<usize> {
+    first_tool_marker_from(text, 0)
+}
+
+fn first_tool_marker_from(text: &str, start: usize) -> Option<usize> {
+    TOOL_MARKERS
+        .into_iter()
+        .filter_map(|marker| text[start.min(text.len())..].find(marker).map(|pos| start.min(text.len()) + pos))
+        .min()
+}
+
+fn may_contain_tool_call(text: &str) -> bool {
+    first_tool_marker(text).is_some()
+        || (text.contains('{')
+            && text.contains("\"name\"")
+            && (text.contains("\"arguments\"")
+                || text.contains("\"input\"")
+                || text.contains("\"parameters\"")))
+        || text.contains("<function=")
+}
+
+fn pending_tool_marker_prefix_len(text: &str) -> usize {
+    let mut keep = 0usize;
+    for marker in TOOL_MARKERS {
+        for len in 1..marker.len() {
+            let prefix = &marker[..len];
+            if text.ends_with(prefix) {
+                keep = keep.max(len);
+            }
+        }
+    }
+    keep
+}
+
+fn streamable_tool_text_end(text: &str, cursor: usize, upstream_done: bool) -> usize {
+    if upstream_done {
+        return text.len();
+    }
+    if let Some(pos) = first_tool_marker_from(text, cursor) {
+        return pos;
+    }
+    text.len().saturating_sub(pending_tool_marker_prefix_len(text))
 }
 
 /// 統計埋點所需的請求中介資料（由 StandardRequest 萃取）。
@@ -189,7 +243,11 @@ pub fn run_completion(
     registry: HashMap<String, String>,
 ) -> impl Stream<Item = OutEvent> {
     let has_tools = std.has_tools();
-    let prompt = std.prompt.clone();
+    let prompt_tokens_hint = if std.stream {
+        estimate_tokens_fast(&std.prompt) as i64
+    } else {
+        count_tokens(&std.prompt) as i64
+    };
     let image_options = std.image_options.clone();
     let params = build_stream_params(&std, image_options);
     let executor = state.executor.clone();
@@ -209,7 +267,8 @@ pub fn run_completion(
         let mut upstream = Box::pin(executor.clone().run_stream(params));
         let mut tracker = ReasoningTracker::new();
         let mut answer_buf = String::new();
-        let mut streamed_content = false; // 無工具時逐步串流
+        let mut streamed_content = false;
+        let mut streamed_answer_cursor = 0usize;
         let mut last_out_tokens = 0i64;
         let mut last_reasoning_tokens = 0i64;
         let mut errored = false;
@@ -244,7 +303,17 @@ pub fn run_completion(
                         if d.phase != "think" && d.phase != "thinking_summary" {
                             probe.mark_first_token();
                             answer_buf.push_str(&d.content);
-                            if !has_tools {
+                            if has_tools {
+                                let end = streamable_tool_text_end(&answer_buf, streamed_answer_cursor, false);
+                                if end > streamed_answer_cursor {
+                                    let delta = answer_buf[streamed_answer_cursor..end].to_string();
+                                    streamed_answer_cursor = end;
+                                    if !delta.is_empty() {
+                                        yield OutEvent::ContentDelta(delta);
+                                        streamed_content = true;
+                                    }
+                                }
+                            } else {
                                 yield OutEvent::ContentDelta(d.content.clone());
                                 streamed_content = true;
                             }
@@ -267,11 +336,12 @@ pub fn run_completion(
                     // 已 yield 給 client 的部分文字救不回，但 has_tools=true 緩衝路徑
                     // （Claude Code 主場景）content 沒 yield 出去，重試對 client 等於透明。
                     tracing::warn!(
-                        "[執行編排] 收到 Retrying，清空本輪 answer_buf({}) / reasoning state",
+                        "[execution] received Retrying; clearing current answer_buf({}) and reasoning state",
                         answer_buf.chars().count()
                     );
                     answer_buf.clear();
                     streamed_content = false;
+                    streamed_answer_cursor = 0;
                     tracker = ReasoningTracker::new();
                     last_out_tokens = 0;
                     last_reasoning_tokens = 0;
@@ -288,13 +358,24 @@ pub fn run_completion(
         // 最終化：工具解析。只要有工具就嘗試解析（parse 內的 regex 對非工具文字會 no-op），
         // 避免漏接 ```json 圍欄形式（looks_like_tool_call 不覆蓋該形式）。
         let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
-        if has_tools && !answer_buf.is_empty() {
+        if has_tools && !answer_buf.is_empty() && may_contain_tool_call(&answer_buf) {
             tool_calls = parse_tool_calls(&answer_buf, &registry);
         }
 
-        // 有工具時，緩衝的可見文字在此一次性送出（剝除工具標記＋裸 JSON tool_call）
+        // With tools, natural-language text streams immediately with a small
+        // holdback to avoid leaking a tool marker split across chunks. Flush the
+        // holdback at the end when no tool call was produced.
         let mut yielded_content_at_end = false;
-        if has_tools && !streamed_content {
+        if has_tools && tool_calls.is_empty() {
+            let end = streamable_tool_text_end(&answer_buf, streamed_answer_cursor, true);
+            if end > streamed_answer_cursor {
+                let delta = answer_buf[streamed_answer_cursor..end].to_string();
+                if !delta.trim().is_empty() {
+                    yield OutEvent::ContentDelta(delta);
+                    yielded_content_at_end = true;
+                }
+            }
+        } else if has_tools && !streamed_content {
             let cleaned = strip_tool_calls_with(&answer_buf, &registry);
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
@@ -303,6 +384,10 @@ pub fn run_completion(
             }
         }
         if !tool_calls.is_empty() {
+            tracing::debug!(
+                "[execution] emitting tool calls: {:?}",
+                tool_calls.iter().map(|tc| tc.name.as_str()).collect::<Vec<_>>()
+            );
             yield OutEvent::ToolCalls(tool_calls.clone());
         }
 
@@ -318,23 +403,21 @@ pub fn run_completion(
             yielded_content_at_end = true;
         }
 
-        // 診斷：thinking 模型偶發「思考完客戶端啥都沒看到」/「看到空 block + Brewed 等待」。
-        // 觸發條件分兩類：
-        //   (A) 完全零輸出：streamed_content=false && yielded_content_at_end=false && tool_calls 空
-        //   (B) 輸出極短（< 30 chars）但 has_tools=true：可能是 thinking 模型送幾乎全空白的 content，
-        //       client UI 顯示 text_block 開了但空白，配上「Brewed/Cogitated」等待 UI 體感像斷流
-        // 兩種都 dump phase 統計 + answer_buf + cleaned 內容（含可見字元化呈現）。
-        let cleaned_full = crate::toolcall::strip_tool_calls_with(&answer_buf, &registry);
-        let cleaned_chars = cleaned_full.chars().count();
+        // Diagnose rare cases where the client effectively sees no text. Keep
+        // the normal end-of-stream path cheap; the expensive stripping only runs
+        // when the output is already suspicious.
+        let visible_chars = answer_buf.chars().count();
         let client_saw_nothing = !streamed_content && !yielded_content_at_end && tool_calls.is_empty();
         let suspicious_short = has_tools
             && !client_saw_nothing
             && tool_calls.is_empty()
-            && cleaned_chars > 0
-            && cleaned_chars < 30;
+            && visible_chars > 0
+            && visible_chars < 30;
         if client_saw_nothing && has_tools {
+            let cleaned_full = crate::toolcall::strip_tool_calls_with(&answer_buf, &registry);
+            let cleaned_chars = cleaned_full.chars().count();
             tracing::warn!(
-                "[執行編排] 客戶端零輸出 phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_is_empty={} last_email={:?} out_tokens={} reasoning_tokens={} answer_buf_full={:?}",
+                "[execution] client saw no output phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_is_empty={} last_email={:?} out_tokens={} reasoning_tokens={} answer_buf_full={:?}",
                 answer_buf.chars().count(),
                 cleaned_chars,
                 cleaned_full.trim().is_empty(),
@@ -344,8 +427,10 @@ pub fn run_completion(
                 answer_buf,
             );
         } else if suspicious_short {
-            tracing::warn!(
-                "[執行編排] 客戶端極短輸出（< 30 chars） phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_full={:?} last_email={:?} out_tokens={} reasoning_tokens={}",
+            let cleaned_full = crate::toolcall::strip_tool_calls_with(&answer_buf, &registry);
+            let cleaned_chars = cleaned_full.chars().count();
+            tracing::debug!(
+                "[execution] suspiciously short client output (< 30 chars) phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_full={:?} last_email={:?} out_tokens={} reasoning_tokens={}",
                 answer_buf.chars().count(),
                 cleaned_chars,
                 cleaned_full,
@@ -356,9 +441,8 @@ pub fn run_completion(
         }
 
         // usage：completion 用上游 output_tokens（最準），prompt 用本地 tiktoken
-        let visible = if has_tools { strip_tool_calls_with(&answer_buf, &registry) } else { answer_buf.clone() };
-        let prompt_tokens = count_tokens(&prompt) as i64;
-        let completion_tokens = if last_out_tokens > 0 { last_out_tokens } else { char_len(&visible) as i64 };
+        let prompt_tokens = prompt_tokens_hint;
+        let completion_tokens = if last_out_tokens > 0 { last_out_tokens } else { char_len(&answer_buf) as i64 };
         let usage = Usage {
             prompt_tokens,
             completion_tokens,

@@ -164,7 +164,7 @@ def build_payload(
     enable_search: bool = False,
     chat_type: str = "t2t",
 ) -> dict[str, Any]:
-    enabled = True if thinking_enabled is None else bool(thinking_enabled)
+    enabled = False if thinking_enabled is None else bool(thinking_enabled)
     if chat_type != "t2t":
         enabled = False
     feature_config = {

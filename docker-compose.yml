@@ -1,11 +1,14 @@
 services:
-  qwen2api-rs:
+  qwen2api:
     build: .
-    image: qwen2api-rs:latest
-    container_name: qwen2api-rs
+    image: qwen2api-python:latest
+    container_name: qwen2api-python
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+      PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
     network_mode: host
     volumes:
       - ./data:/app/data

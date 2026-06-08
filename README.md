@@ -1,27 +1,24 @@
-# qwen2api-rs
+# qwen2api Python
 
-API-only gateway that exposes Qwen Web as OpenAI, Anthropic, Gemini, image, video, file, and embedding compatible endpoints.
+FastAPI gateway that exposes Qwen Web as OpenAI and Anthropic compatible APIs. The implementation follows the current qwen2api flow, but uses the same Python stack style as `FreeAIchat-2api`: `fastapi`, `uvicorn`, `curl_cffi`, `pydantic-settings`, and `python-dotenv`.
 
-This project is a Rust rewrite of the core gateway ideas from `YuJunZhiXue/qwen2API`. It intentionally does not ship a browser Web UI. The service is designed to be started on a server with Docker Compose and configured through a small `.env` file.
+The Python implementation only forwards normal chat content and thinking/text streaming.
 
-## Features
+## Endpoints
 
-- OpenAI Chat Completions: `/v1/chat/completions`
-- OpenAI Responses: `/v1/responses`
-- Anthropic Messages: `/v1/messages`, `/anthropic/v1/messages`
-- Gemini `generateContent` and `streamGenerateContent`
-- OpenAI Images and Videos backed by Qwen `t2i` / `t2v`
-- File upload and attachment forwarding
-- Text-based tool calling for clients that expect function/tool calls
-- Account pool with retries, rate-limit cooldowns, token refresh, and chat_id prewarming
-- Health probes: `/healthz`, `/readyz`
+- `GET /healthz`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /chat/completions`
+- `POST /v1/messages`
+- `POST /messages`
+- `POST /anthropic/v1/messages`
 
 ## Configuration
 
-Copy the example file and fill in the values you need:
-
 ```bash
 cp .env.example .env
+mkdir -p data
 ```
 
 Minimal `.env`:
@@ -30,61 +27,45 @@ Minimal `.env`:
 API_KEY=sk-qwen2api-change-me
 PORT=7860
 DATA_DIR=./data
+DEFAULT_MODEL=qwen3.7-plus
 ```
 
-Provide Qwen accounts in one of two ways:
+Provide Qwen accounts through `data/accounts.json`:
 
 ```json
 [
   {
     "email": "user@example.com",
-    "token": "token-from-chat.qwen.ai-localStorage",
-    "password": "optional-used-for-token-refresh"
+    "token": "token-from-chat.qwen.ai-localStorage"
   }
 ]
 ```
 
-Save that JSON as `data/accounts.json`, or pass the same JSON array through `QWEN_ACCOUNTS_JSON`.
-
-Optional env values:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `API_KEY` | API key required by compatibility endpoints. | `change-me-now` |
-| `PORT` | HTTP listen port. Docker uses host networking. | `7860` |
-| `DATA_DIR` | Persistent state directory. | `./data` |
-| `QWEN_ACCOUNTS_JSON` | Inline JSON array of Qwen accounts. | unset |
-| `ACCOUNTS_FILE` | Custom account JSON path. | `$DATA_DIR/accounts.json` |
-| `UPSTREAM_PROXY` | Outbound proxy for `chat.qwen.ai`. `HTTP_PROXY` / `HTTPS_PROXY` also work. | unset |
-| `DEFAULT_MODEL` | Fallback Qwen model for unknown aliases. | `qwen3.7-plus` |
-| `LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, or `error`. | `info` |
-
-All pool, retry, media, context, and refresh tuning uses code defaults.
+Or pass the same JSON array through `QWEN_ACCOUNTS_JSON`.
 
 ## Docker
 
-The Compose setup mirrors the simple server workflow used by `FreeAIchat-2api`: it reads `.env`, uses host networking, and persists data in `./data`.
+The Dockerfile uses domestic mirrors for mainland China deployments:
+
+- Debian apt: `mirrors.aliyun.com`
+- PyPI: `https://pypi.tuna.tsinghua.edu.cn/simple`
 
 ```bash
-mkdir -p data
-cp .env.example .env
-vim .env
 docker compose up -d --build
-docker compose logs -f qwen2api-rs
+docker compose logs -f qwen2api
 curl -s http://127.0.0.1:7860/healthz
 ```
 
-Because `network_mode: host` is used, `PORT` is the host port directly.
+`network_mode: host` is used, so `PORT` maps directly to the host.
 
-## Binary
+## Local Run
 
 ```bash
-cargo run
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+uvicorn main:app --host 0.0.0.0 --port 7860
 ```
 
-or run a built binary with the same `.env` file in the working directory.
-
-## API Examples
+## Examples
 
 OpenAI compatible:
 
@@ -92,7 +73,7 @@ OpenAI compatible:
 curl http://127.0.0.1:7860/v1/chat/completions \
   -H "Authorization: Bearer sk-qwen2api-change-me" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
 Anthropic compatible:
@@ -100,35 +81,6 @@ Anthropic compatible:
 ```bash
 curl http://127.0.0.1:7860/v1/messages \
   -H "x-api-key: sk-qwen2api-change-me" \
-  -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-3-5-sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"qwen3.7-plus","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
-
-Gemini compatible:
-
-```bash
-curl "http://127.0.0.1:7860/v1beta/models/gemini-2.5-pro:generateContent" \
-  -H "x-goog-api-key: sk-qwen2api-change-me" \
-  -H "Content-Type: application/json" \
-  -d '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}'
-```
-
-## Main Files
-
-```text
-src/main.rs             routes and lifecycle
-src/config.rs           small public env surface plus internal defaults
-src/account/            Qwen account pool
-src/upstream/           Qwen HTTP/SSE client, payloads, executor, chat_id prewarm
-src/request/            protocol request normalization
-src/execution/          stream normalization and protocol output translation
-src/toolcall/           prompt-injected tool calls and parser
-src/context/            files, attachments, OSS upload
-src/media.rs            image/video task queue and local backups
-src/api/                OpenAI, Anthropic, Gemini, files, media, probes
-```
-
-## Notes
-
-Use this project only for self-hosted experimentation and comply with the upstream service terms. Qwen Web behavior can change without notice.

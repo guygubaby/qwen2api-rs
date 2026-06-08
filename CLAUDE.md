@@ -1,29 +1,25 @@
-# qwen2api-rs — Project AI Context
+# qwen2api — Project AI Context
 
-Qwen Web gateway exposed as OpenAI/Anthropic/Gemini compatible APIs. **Rust backend only** (`axum`/`tokio`/`reqwest`); the browser Web UI has been removed.
-Based on the upstream `YuJunZhiXue/qwen2API` rewrite work. Upstream sync notes live in `dev/UPSTREAM.md`, protocol notes in `dev/PROTOCOL.md`, and architecture notes in `dev/ARCHITECTURE.md`.
-The public env surface is intentionally small; see `.env.example` for the supported deployment variables.
+Qwen Web gateway exposed as OpenAI/Anthropic compatible APIs. **The active backend is Python FastAPI**, aligned with the `FreeAIchat-2api` stack: `fastapi`, `uvicorn`, `curl_cffi`, `pydantic-settings`, and `python-dotenv`.
+The gateway supports normal chat plus thinking/text streaming only. External action invocation protocols are intentionally not implemented. See `.env.example` for supported deployment variables.
 
 ## 開發 / 執行注意
-- `CARGO_TARGET_DIR=/home/joe/.cache/cargo-target` → 二進位在該處的 `debug/`、`release/`，**不是** `./target`。
-- 前景 `sleep` 被 harness 阻擋（exit 144）→ 啟動長駐服務用背景任務 + `curl --retry --retry-connrefused` 等就緒。
-- 本機測試用 port 7866、`ADMIN_KEY=testadmin123`、`data/` 放少量真實帳號；正式部署在 7860（見下）。
-- 真實測試帳號來源：`/home/joe/文件/docker/qwen2API/data/accounts.json`（約 16,857 個）。
-- 本機開發**不要**用根目錄 `docker-compose.yml`（那份是部署範例、用 7860）；直接 `cargo run` 讀 `.env`（已預設 PORT=7866、ADMIN_KEY=testadmin123）。正式部署看下方。
+- Install dependencies with a mainland mirror: `pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple`.
+- Local config is read from `.env`; authentication uses `API_KEY`.
+- Qwen accounts live in `data/accounts.json` or `QWEN_ACCOUNTS_JSON`.
+- Local run: `uvicorn main:app --host 0.0.0.0 --port 7860`.
 
 ## 部署（Docker，正式環境）
-**部署位置：`/home/joe/文件/docker/qwen2api-rs/`**（與原 Python 版 `qwen2API` 並列）。
-- 該資料夾只放 `docker-compose.yml` + `data/`（accounts.json / api_keys.json / users.json）；**源碼留在本 dev 專案**，compose 以 `build.context: ../../dev/qwen2api-rs` 從這裡建置。
-- 對外端口 **7860**（取代原 Python 版）。`ADMIN_KEY` 沿用原版值，使既有 API Key 不失效。
-- ⚠️ **風控代理必帶**：原版 `docker-compose.override.yml` 讓出口走 `HTTP(S)_PROXY=http://ramdon:joe@192.168.1.203:2260`（隨機出口 IP）。新 compose 的 `environment` 必須設相同 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY`；reqwest 預設會讀這些 env，無需改碼。
-- 完整遷移/部署 runbook 見 **`dev/DEPLOY.md`**。
+- Dockerfile uses Python 3.12 slim, Aliyun Debian mirrors, and Tsinghua PyPI.
+- `docker-compose.yml` uses host networking and exposes `PORT=7860` directly.
+- Persistent data is `data/accounts.json`. Configure outbound proxy with `UPSTREAM_PROXY` or standard `HTTP_PROXY/HTTPS_PROXY`.
+- Deployment instructions live in `README.md`.
 
 ## 🔁 [流程] 每次開發完成後的重新部署
-開發改完、`cargo build` 通過、本機(7866)驗證 OK 後：
+After code changes pass Python syntax/import checks and a health check:
 ```bash
-cd /home/joe/文件/docker/qwen2api-rs
-docker compose up -d --build      # 從 ../../dev/qwen2api-rs 重新建置並滾動更新
-docker compose logs -f --tail=30  # 確認啟動 + 帳號載入
-curl -s http://127.0.0.1:7860/healthz   # 應 200
+docker compose up -d --build
+docker compose logs -f --tail=30
+curl -s http://127.0.0.1:7860/healthz
 ```
-資料（帳號/金鑰）在 `data/` 持久化，重部署不丟。完成後依全域規則對「服務部署完成」發 tg-notify。
+Data under `data/` is persistent across rebuilds.

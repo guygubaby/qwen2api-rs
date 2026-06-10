@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     QWEN_BASE_URL: str = "https://chat.qwen.ai"
     QWEN_REQUEST_TIMEOUT_SECONDS: int = 300
     CHAT_DELETE_ON_CLOSE: bool = True
+    MAX_INFLIGHT_PER_ACCOUNT: int = 1
+    ACCOUNT_MIN_INTERVAL_MS: int = 3000
+    EMPTY_RESPONSE_RETRY_ATTEMPTS: int = 1
+    EMPTY_RESPONSE_COOLDOWN_MS: int = 60000
 
     class Config:
         env_file = ".env"

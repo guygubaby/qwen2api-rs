@@ -39,15 +39,49 @@ class AccountPool:
             for idx, item in enumerate(settings.load_accounts())
         ]
         self._index = 0
-        self._lock = asyncio.Lock()
+        self._inflight = {account.email: 0 for account in self._accounts}
+        self._last_released = {account.email: 0.0 for account in self._accounts}
+        self._cooldown_until = {account.email: 0.0 for account in self._accounts}
+        self._condition = asyncio.Condition()
 
     async def acquire(self) -> Account:
-        async with self._lock:
+        async with self._condition:
             if not self._accounts:
                 raise RuntimeError("no Qwen accounts configured")
-            account = self._accounts[self._index % len(self._accounts)]
-            self._index += 1
-            return account
+            while True:
+                now = time.monotonic()
+                wait_seconds = None
+                for offset in range(len(self._accounts)):
+                    idx = (self._index + offset) % len(self._accounts)
+                    account = self._accounts[idx]
+                    inflight = self._inflight[account.email]
+                    cooldown = settings.ACCOUNT_MIN_INTERVAL_MS / 1000
+                    next_at = max(
+                        self._last_released[account.email] + cooldown,
+                        self._cooldown_until[account.email],
+                    )
+                    if inflight < settings.MAX_INFLIGHT_PER_ACCOUNT and now >= next_at:
+                        self._index = (idx + 1) % len(self._accounts)
+                        self._inflight[account.email] = inflight + 1
+                        return account
+                    if inflight < settings.MAX_INFLIGHT_PER_ACCOUNT:
+                        delay = max(0.0, next_at - now)
+                        wait_seconds = delay if wait_seconds is None else min(wait_seconds, delay)
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=wait_seconds or 0.5)
+                except TimeoutError:
+                    pass
+
+    async def release(self, account: Account, cooldown_ms: int | None = None) -> None:
+        async with self._condition:
+            self._inflight[account.email] = max(0, self._inflight.get(account.email, 0) - 1)
+            self._last_released[account.email] = time.monotonic()
+            if cooldown_ms:
+                self._cooldown_until[account.email] = max(
+                    self._cooldown_until.get(account.email, 0.0),
+                    time.monotonic() + cooldown_ms / 1000,
+                )
+            self._condition.notify_all()
 
     def count(self) -> int:
         return len(self._accounts)

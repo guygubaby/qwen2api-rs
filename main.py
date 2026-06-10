@@ -22,6 +22,11 @@ app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, description
 pool = AccountPool()
 client = QwenClient()
 THINKING_MODEL_SUFFIX = "-thinking"
+EMPTY_RESPONSE_MESSAGE = "Qwen upstream returned empty streams after retries; the account is likely rate limited."
+
+
+class UpstreamEmptyResponseError(RuntimeError):
+    pass
 
 
 async def verify_api_key(
@@ -91,34 +96,116 @@ async def qwen_events(body: dict[str, Any]) -> AsyncGenerator[tuple[str, str], N
     prompt = build_prompt(body)
     thinking_enabled = request_enables_thinking(body)
 
-    account = await pool.acquire()
-    chat_id = await client.create_chat(account.token, model, "t2t")
-    reasoning_seen = ""
-    try:
-        payload = build_payload(
-            chat_id=chat_id,
-            model=model,
-            prompt=prompt,
-            thinking_enabled=thinking_enabled,
-            enable_search=bool(body.get("enable_search") or body.get("web_search")),
+    request_id = uuid.uuid4().hex[:8]
+    max_attempts = max(1, settings.EMPTY_RESPONSE_RETRY_ATTEMPTS + 1)
+
+    for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
+        content_chars = 0
+        reasoning_chars = 0
+        delta_count = 0
+        retry_empty = False
+        cooldown_ms: int | None = None
+        account = await pool.acquire()
+        chat_id: str | None = None
+        reasoning_seen = ""
+        logger.debug(
+            "[qwen-request:%s] start attempt=%d/%d model=%s thinking=%s account=%s prompt_chars=%d",
+            request_id,
+            attempt,
+            max_attempts,
+            model,
+            thinking_enabled,
+            account.email,
+            len(prompt),
         )
-        async for line in client.stream_chat(account.token, chat_id, payload):
-            for delta in parse_sse_line(line):
-                if delta.reasoning_cumulative:
-                    if delta.reasoning_cumulative.startswith(reasoning_seen):
-                        inc = delta.reasoning_cumulative[len(reasoning_seen):]
-                    else:
-                        inc = delta.reasoning_cumulative
-                    reasoning_seen = delta.reasoning_cumulative
-                    if inc:
-                        yield ("reasoning", inc)
-                if delta.reasoning_incremental:
-                    yield ("reasoning", delta.reasoning_incremental)
-                if delta.content and delta.phase not in {"think", "thinking_summary"}:
-                    yield ("content", delta.content)
-        yield ("done", "")
-    finally:
-        await client.delete_chat(account.token, chat_id)
+        try:
+            chat_id = await client.create_chat(account.token, model, "t2t")
+            logger.debug("[qwen-request:%s] chat_created attempt=%d chat_id=%s", request_id, attempt, chat_id)
+            payload = build_payload(
+                chat_id=chat_id,
+                model=model,
+                prompt=prompt,
+                thinking_enabled=thinking_enabled,
+                enable_search=bool(body.get("enable_search") or body.get("web_search")),
+            )
+            async for line in client.stream_chat(account.token, chat_id, payload):
+                for delta in parse_sse_line(line):
+                    delta_count += 1
+                    if delta.reasoning_cumulative:
+                        if delta.reasoning_cumulative.startswith(reasoning_seen):
+                            inc = delta.reasoning_cumulative[len(reasoning_seen):]
+                        else:
+                            inc = delta.reasoning_cumulative
+                        reasoning_seen = delta.reasoning_cumulative
+                        if inc:
+                            reasoning_chars += len(inc)
+                            yield ("reasoning", inc)
+                    if delta.reasoning_incremental:
+                        reasoning_chars += len(delta.reasoning_incremental)
+                        yield ("reasoning", delta.reasoning_incremental)
+                    if delta.content and delta.phase not in {"think", "thinking_summary"}:
+                        content_chars += len(delta.content)
+                        yield ("content", delta.content)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if content_chars == 0 and reasoning_chars == 0:
+                cooldown_ms = settings.EMPTY_RESPONSE_COOLDOWN_MS
+                retry_empty = attempt < max_attempts
+                logger.warning(
+                    "[qwen-request:%s] empty_content attempt=%d/%d retry=%s model=%s account=%s chat_id=%s deltas=%d elapsed_ms=%d cooldown_ms=%d",
+                    request_id,
+                    attempt,
+                    max_attempts,
+                    retry_empty,
+                    model,
+                    account.email,
+                    chat_id,
+                    delta_count,
+                    elapsed_ms,
+                    cooldown_ms,
+                )
+            else:
+                logger.debug(
+                    "[qwen-request:%s] finish attempt=%d/%d model=%s account=%s chat_id=%s deltas=%d content_chars=%d reasoning_chars=%d elapsed_ms=%d",
+                    request_id,
+                    attempt,
+                    max_attempts,
+                    model,
+                    account.email,
+                    chat_id,
+                    delta_count,
+                    content_chars,
+                    reasoning_chars,
+                    elapsed_ms,
+                )
+                yield ("done", "")
+                return
+        except Exception:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.exception(
+                "[qwen-request:%s] failed attempt=%d/%d model=%s account=%s chat_id=%s deltas=%d content_chars=%d reasoning_chars=%d elapsed_ms=%d",
+                request_id,
+                attempt,
+                max_attempts,
+                model,
+                account.email,
+                chat_id,
+                delta_count,
+                content_chars,
+                reasoning_chars,
+                elapsed_ms,
+            )
+            raise
+        finally:
+            if chat_id is not None:
+                await client.delete_chat(account.token, chat_id)
+            await pool.release(account, cooldown_ms=cooldown_ms)
+
+        if not retry_empty:
+            break
+
+    logger.error("[qwen-request:%s] exhausted_empty_retries model=%s attempts=%d", request_id, model, max_attempts)
+    raise UpstreamEmptyResponseError(EMPTY_RESPONSE_MESSAGE)
 
 
 @app.get("/healthz")
@@ -158,15 +245,24 @@ async def chat_completions(request: Request) -> Any:
                 "model": model,
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             })
-            async for kind, text in qwen_events(body):
-                if kind == "content":
-                    yield openai_sse({
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-                    })
+            try:
+                async for kind, text in qwen_events(body):
+                    if kind == "content":
+                        yield openai_sse({
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                        })
+            except UpstreamEmptyResponseError as exc:
+                logger.warning("[openai-stream:%s] upstream_empty_response %s", chat_id, exc)
+                yield (
+                    "event: error\n"
+                    f"data: {json.dumps({'error': {'message': str(exc), 'type': 'rate_limit_error'}}, ensure_ascii=False)}\n\n"
+                )
+                yield "data: [DONE]\n\n"
+                return
             yield openai_sse({
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -179,9 +275,12 @@ async def chat_completions(request: Request) -> Any:
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     content = ""
-    async for kind, text in qwen_events(body):
-        if kind == "content":
-            content += text
+    try:
+        async for kind, text in qwen_events(body):
+            if kind == "content":
+                content += text
+    except UpstreamEmptyResponseError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return {
         "id": chat_id,
         "object": "chat.completion",
@@ -218,39 +317,47 @@ async def anthropic_messages(request: Request) -> Any:
             })
             index = 0
             current: str | None = None
-            async for kind, text in qwen_events(body):
-                if kind == "reasoning":
-                    if current != "thinking":
-                        if current is not None:
-                            yield anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index})
-                            index += 1
-                        current = "thinking"
-                        yield anthropic_sse("content_block_start", {
-                            "type": "content_block_start",
+            try:
+                async for kind, text in qwen_events(body):
+                    if kind == "reasoning":
+                        if current != "thinking":
+                            if current is not None:
+                                yield anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index})
+                                index += 1
+                            current = "thinking"
+                            yield anthropic_sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {"type": "thinking", "thinking": "", "signature": "qwen2api-python"},
+                            })
+                        yield anthropic_sse("content_block_delta", {
+                            "type": "content_block_delta",
                             "index": index,
-                            "content_block": {"type": "thinking", "thinking": "", "signature": "qwen2api-python"},
+                            "delta": {"type": "thinking_delta", "thinking": text},
                         })
-                    yield anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "thinking_delta", "thinking": text},
-                    })
-                elif kind == "content":
-                    if current != "text":
-                        if current is not None:
-                            yield anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index})
-                            index += 1
-                        current = "text"
-                        yield anthropic_sse("content_block_start", {
-                            "type": "content_block_start",
+                    elif kind == "content":
+                        if current != "text":
+                            if current is not None:
+                                yield anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index})
+                                index += 1
+                            current = "text"
+                            yield anthropic_sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                        yield anthropic_sse("content_block_delta", {
+                            "type": "content_block_delta",
                             "index": index,
-                            "content_block": {"type": "text", "text": ""},
+                            "delta": {"type": "text_delta", "text": text},
                         })
-                    yield anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "text_delta", "text": text},
-                    })
+            except UpstreamEmptyResponseError as exc:
+                logger.warning("[anthropic-stream:%s] upstream_empty_response %s", message_id, exc)
+                yield anthropic_sse("error", {
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": str(exc)},
+                })
+                return
             if current is not None:
                 yield anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index})
             yield anthropic_sse("message_delta", {
@@ -263,9 +370,12 @@ async def anthropic_messages(request: Request) -> Any:
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     content = ""
-    async for kind, text in qwen_events(body):
-        if kind == "content":
-            content += text
+    try:
+        async for kind, text in qwen_events(body):
+            if kind == "content":
+                content += text
+    except UpstreamEmptyResponseError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return {
         "id": message_id,
         "type": "message",
